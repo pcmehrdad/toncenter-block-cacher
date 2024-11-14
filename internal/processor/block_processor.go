@@ -13,14 +13,67 @@ import (
 )
 
 type BlockProcessor struct {
-	client *api.Client
-	config *config.Config
+	client    *api.Client
+	config    *config.Config
+	validator utils.BlockValidator
+	fs        *utils.FileSystem
+	stats     struct {
+		sync.Mutex
+		processedBlocks int
+		startTime       time.Time
+		lastUpdate      time.Time
+		recentBlocks    []string
+	}
 }
 
-func NewBlockProcessor(cfg *config.Config) *BlockProcessor {
-	return &BlockProcessor{
-		client: api.NewClient(cfg.BaseURL, cfg.APIKey, cfg.TotalRateLimit),
-		config: cfg,
+func NewBlockProcessor(cfg *config.Config, validator utils.BlockValidator) *BlockProcessor {
+	bp := &BlockProcessor{
+		client:    api.NewClient(cfg.BaseURL, cfg.APIKeys, cfg.RateLimitPerKey),
+		config:    cfg,
+		validator: validator,
+		fs:        utils.NewFileSystem(cfg.SavePath, validator),
+	}
+	bp.stats.recentBlocks = make([]string, 0, 10)
+	return bp
+}
+
+func (bp *BlockProcessor) updateDisplay() {
+	bp.stats.Lock()
+	defer bp.stats.Unlock()
+
+	now := time.Now()
+	if now.Sub(bp.stats.lastUpdate) >= time.Second {
+		elapsed := now.Sub(bp.stats.startTime).Seconds()
+		bps := float64(bp.stats.processedBlocks) / elapsed
+
+		// Move to top and clear screen
+		fmt.Print("\033[H\033[2J")
+
+		// Print stats
+		fmt.Printf("\033[1;36mton-block-processor => Average BPS: %.2f/s\033[0m\n", bps)
+
+		// Print recent blocks
+		for _, block := range bp.stats.recentBlocks {
+			fmt.Printf("\033[32m%s\033[0m\n", block)
+		}
+
+		bp.stats.lastUpdate = now
+	}
+}
+
+func (bp *BlockProcessor) addBlock(block int) {
+	bp.stats.Lock()
+	defer bp.stats.Unlock()
+
+	bp.stats.processedBlocks++
+	msg := fmt.Sprintf("Completed processing block %d", block)
+
+	if len(bp.stats.recentBlocks) >= 10 {
+		// Shift array left
+		copy(bp.stats.recentBlocks, bp.stats.recentBlocks[1:])
+		bp.stats.recentBlocks[len(bp.stats.recentBlocks)-1] = msg
+	} else {
+		bp.stats.recentBlocks = append(bp.stats.recentBlocks, msg)
 	}
 }
 
@@ -28,6 +81,20 @@ func (bp *BlockProcessor) ProcessBlocks(blocks []int) error {
 	var wg sync.WaitGroup
 	errors := make(chan error, len(blocks))
 	semaphore := make(chan struct{}, bp.config.MaxParallelBlocks)
+
+	// Hide cursor
+	fmt.Print("\033[?25l")
+	defer fmt.Print("\033[?25h")
+
+	// Initialize stats
+	bp.stats.processedBlocks = 0
+	bp.stats.startTime = time.Now()
+	bp.stats.lastUpdate = time.Now()
+	bp.stats.recentBlocks = make([]string, 0, 10)
+
+	// Initial display
+	fmt.Print("\033[H\033[2J")
+	fmt.Printf("\033[1;36mton-block-processor => Average BPS: 0.00/s\033[0m\n")
 
 	for _, block := range blocks {
 		time.Sleep(bp.config.BetweenBlockDelay)
@@ -50,7 +117,8 @@ func (bp *BlockProcessor) ProcessBlocks(blocks []int) error {
 					continue
 				}
 
-				fmt.Printf("Completed processing block %d\n", mcSeqno)
+				bp.addBlock(mcSeqno)
+				bp.updateDisplay()
 				return
 			}
 		}(block)
@@ -59,9 +127,12 @@ func (bp *BlockProcessor) ProcessBlocks(blocks []int) error {
 	wg.Wait()
 	close(errors)
 
+	// Move to bottom of display
+	fmt.Printf("\033[%d;1H", 12)
+
 	var errCount int
 	for err := range errors {
-		fmt.Printf("Error: %v\n", err)
+		fmt.Printf("\033[31mError: %v\033[0m\n", err)
 		errCount++
 	}
 
@@ -81,6 +152,7 @@ func (bp *BlockProcessor) processBlock(mcSeqno int) error {
 			return fmt.Errorf("fetch chunk: %w", err)
 		}
 
+		// If no events are returned, break the loop
 		if len(chunk.Chunk.Events) == 0 {
 			break
 		}
@@ -91,6 +163,11 @@ func (bp *BlockProcessor) processBlock(mcSeqno int) error {
 		}
 		for addr, info := range chunk.Chunk.AddressBook {
 			finalResult.AddressBook[addr] = info
+		}
+
+		// If we received fewer events than the limit, we've got all events
+		if len(chunk.Chunk.Events) < bp.config.LimitOffset {
+			break
 		}
 
 		offset += bp.config.LimitOffset
@@ -106,6 +183,5 @@ func (bp *BlockProcessor) processBlock(mcSeqno int) error {
 		return fmt.Errorf("marshal addresses: %w", err)
 	}
 
-	fs := utils.NewFileSystem(bp.config.SavePath)
-	return fs.SaveBlockData(mcSeqno, events, addresses)
+	return bp.fs.SaveBlockData(mcSeqno, events, addresses)
 }

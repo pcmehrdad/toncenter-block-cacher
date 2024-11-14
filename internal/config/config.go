@@ -3,16 +3,20 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
 )
 
 type Config struct {
-	APIKey              string
+	APIKeys             []string
 	BaseURL             string
 	SavePath            string
+	StartBlock          int
+	EndBlock            int
 	TotalRateLimit      int
+	RateLimitPerKey     int
 	LimitOffset         int
 	MaxParallelRequests int
 	MaxParallelBlocks   int
@@ -26,31 +30,35 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 
-	rateLimit, _ := strconv.Atoi(getEnvWithDefault("TOTAL_RATE_LIMIT", "8"))
-	limitOffset, _ := strconv.Atoi(getEnvWithDefault("LIMIT_OFFSET", "500"))
-	maxRequests, _ := strconv.Atoi(getEnvWithDefault("MAX_PARALLEL_REQUESTS", "2"))
-	maxBlocks, _ := strconv.Atoi(getEnvWithDefault("MAX_PARALLEL_BLOCKS", "5"))
-	chunkSize, _ := strconv.Atoi(getEnvWithDefault("CHUNK_SIZE", "1000"))
-	retryDelay, _ := strconv.Atoi(getEnvWithDefault("RETRY_DELAY", "1"))
-	blockDelay, _ := strconv.Atoi(getEnvWithDefault("BETWEEN_BLOCK_DELAY", "100"))
+	apiKeys := strings.Split(os.Getenv("TONCENTER_API_KEYS"), ",")
+	rateLimit, _ := strconv.Atoi(os.Getenv("TOTAL_RATE_LIMIT"))
+	rateLimitPerKey := rateLimit
+	if len(apiKeys) > 0 {
+		rateLimitPerKey = rateLimit / len(apiKeys)
+	}
 
 	return &Config{
-		APIKey:              os.Getenv("TON_API_KEY"),
+		APIKeys:             apiKeys,
 		BaseURL:             os.Getenv("TON_API_BASE_URL"),
 		SavePath:            os.Getenv("SAVE_PATH_FOR_BLOCKS"),
+		StartBlock:          intEnv("START_BLOCK", 35119787),
+		EndBlock:            intEnv("END_BLOCK", 999999999),
 		TotalRateLimit:      rateLimit,
-		LimitOffset:         limitOffset,
-		MaxParallelRequests: maxRequests,
-		MaxParallelBlocks:   maxBlocks,
-		ChunkSize:           chunkSize,
-		RetryDelay:          time.Duration(retryDelay) * time.Second,
-		BetweenBlockDelay:   time.Duration(blockDelay) * time.Millisecond,
+		RateLimitPerKey:     rateLimitPerKey,
+		LimitOffset:         intEnv("LIMIT_OFFSET", 500),
+		MaxParallelRequests: intEnv("MAX_PARALLEL_REQUESTS", 2),
+		MaxParallelBlocks:   intEnv("MAX_PARALLEL_BLOCKS", 5),
+		ChunkSize:           intEnv("CHUNK_SIZE", 1000),
+		RetryDelay:          time.Duration(intEnv("RETRY_DELAY", 1)) * time.Millisecond,
+		BetweenBlockDelay:   time.Duration(intEnv("BETWEEN_BLOCK_DELAY", 100)) * time.Millisecond,
 	}, nil
 }
 
-func getEnvWithDefault(key, defaultValue string) string {
+func intEnv(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
-		return value
+		if i, err := strconv.Atoi(value); err == nil {
+			return i
+		}
 	}
 	return defaultValue
 }

@@ -16,17 +16,21 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// These could also be moved to config if they change frequently
-	startBlock := 35119787
-	endBlock := 41992365
+	// Initialize validators
+	fastValidator := &utils.FastBlockValidator{}
+	thoroughValidator := &utils.ThoroughBlockValidator{}
 
-	blockProcessor := processor.NewBlockProcessor(cfg)
-	blocks := getBlocksToProcess(cfg, startBlock, endBlock)
+	// Initialize filesystem with fast validator for initial scan
+	fs := utils.NewFileSystem(cfg.SavePath, fastValidator)
+	blocks := fs.GetBlocksToProcess(cfg.StartBlock, cfg.EndBlock)
 
 	if len(blocks) == 0 {
 		fmt.Println("No blocks to process")
 		return
 	}
+
+	// Initialize block processor with thorough validator for processing
+	blockProcessor := processor.NewBlockProcessor(cfg, thoroughValidator)
 
 	// Print summary
 	fmt.Printf("Total blocks to process: %d\n", len(blocks))
@@ -56,9 +60,4 @@ func main() {
 	}
 
 	fmt.Println("Completed processing all blocks")
-}
-
-func getBlocksToProcess(cfg *config.Config, startBlock, endBlock int) []int {
-	fs := utils.NewFileSystem(cfg.SavePath)
-	return fs.GetBlocksToProcess(startBlock, endBlock)
 }

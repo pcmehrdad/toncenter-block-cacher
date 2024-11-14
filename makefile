@@ -4,4 +4,4 @@ run:
 	go run ./cmd/processor/main.go
 
 build:
-	go build -o bin/processor ./cmd/processor
+	go build -o bin/ton-block-processor ./cmd/processor

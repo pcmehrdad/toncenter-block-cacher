@@ -5,30 +5,50 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 
 	"ton-block-processor/internal/models"
 	"ton-block-processor/internal/utils"
 )
 
 type Client struct {
-	baseURL     string
-	apiKey      string
-	rateLimiter *utils.RateLimiter
+	baseURL      string
+	apiKeys      []string
+	rateLimiters []*utils.RateLimiter
+	currentKey   int
+	mu           sync.Mutex
 }
 
-func NewClient(baseURL, apiKey string, rateLimit int) *Client {
+func NewClient(baseURL string, apiKeys []string, rateLimitPerKey int) *Client {
+	rateLimiters := make([]*utils.RateLimiter, len(apiKeys))
+	for i := range apiKeys {
+		rateLimiters[i] = utils.NewRateLimiter(rateLimitPerKey)
+	}
+
 	return &Client{
-		baseURL:     baseURL,
-		apiKey:      apiKey,
-		rateLimiter: utils.NewRateLimiter(rateLimit),
+		baseURL:      baseURL,
+		apiKeys:      apiKeys,
+		rateLimiters: rateLimiters,
 	}
 }
 
+func (c *Client) getNextKey() (string, *utils.RateLimiter) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	key := c.apiKeys[c.currentKey]
+	limiter := c.rateLimiters[c.currentKey]
+	c.currentKey = (c.currentKey + 1) % len(c.apiKeys)
+
+	return key, limiter
+}
+
 func (c *Client) FetchChunk(mcSeqno, limit, offset int) (*models.ChunkResponse, error) {
-	c.rateLimiter.Wait()
+	apiKey, rateLimiter := c.getNextKey()
+	rateLimiter.Wait()
 
 	url := fmt.Sprintf("%s?api_key=%s&mc_seqno=%d&limit=%d&offset=%d&sort=asc",
-		c.baseURL, c.apiKey, mcSeqno, limit, offset)
+		c.baseURL, apiKey, mcSeqno, limit, offset)
 
 	resp, err := http.Get(url)
 	if err != nil {
