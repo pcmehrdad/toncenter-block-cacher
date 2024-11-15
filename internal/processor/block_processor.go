@@ -6,10 +6,10 @@ import (
 	"sync"
 	"time"
 
-	"ton-block-processor/internal/api"
-	"ton-block-processor/internal/config"
-	"ton-block-processor/internal/models"
-	"ton-block-processor/internal/utils"
+	"toncenter-block-cacher/internal/api"
+	"toncenter-block-cacher/internal/config"
+	"toncenter-block-cacher/internal/models"
+	"toncenter-block-cacher/internal/utils"
 )
 
 type BlockProcessor struct {

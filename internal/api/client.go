@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"sync"
 
-	"ton-block-processor/internal/models"
-	"ton-block-processor/internal/utils"
+	"toncenter-block-cacher/internal/models"
+	"toncenter-block-cacher/internal/utils"
 )
 
 type Client struct {

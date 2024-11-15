@@ -3,57 +3,45 @@ package config
 import (
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
 )
 
 type Config struct {
-	APIKeys             []string
-	BaseURL             string
-	SavePath            string
-	StartBlock          int
-	EndBlock            int
-	TotalRateLimit      int
-	RateLimitPerKey     int
-	LimitOffset         int
-	MaxParallelRequests int
-	MaxParallelBlocks   int
-	ChunkSize           int
-	RetryDelay          time.Duration
-	BetweenBlockDelay   time.Duration
+	ApiTonCenterKEY     string
+	ApiTonCenterBaseURL string
+	ApiTonCenterRPS     int
+	ApiFetchLimit       int
+	BlocksSavePath      string
+	MaxSavedBlocks      int
+	MaxParallelFetches  int
+	DelayOnRetry        time.Duration
+	DelayOnBlocks       time.Duration
 }
 
 func LoadConfig() (*Config, error) {
+	// Load environment variables from .env file
 	if err := godotenv.Load(); err != nil {
 		return nil, err
 	}
 
-	apiKeys := strings.Split(os.Getenv("TONCENTER_API_KEYS"), ",")
-	rateLimit, _ := strconv.Atoi(os.Getenv("TOTAL_RATE_LIMIT"))
-	rateLimitPerKey := rateLimit
-	if len(apiKeys) > 0 {
-		rateLimitPerKey = rateLimit / len(apiKeys)
-	}
-
+	// Return the configuration struct with updated variable names and static values
 	return &Config{
-		APIKeys:             apiKeys,
-		BaseURL:             os.Getenv("TON_API_BASE_URL"),
-		SavePath:            os.Getenv("SAVE_PATH_FOR_BLOCKS"),
-		StartBlock:          intEnv("START_BLOCK", 35119787),
-		EndBlock:            intEnv("END_BLOCK", 999999999),
-		TotalRateLimit:      rateLimit,
-		RateLimitPerKey:     rateLimitPerKey,
-		LimitOffset:         intEnv("LIMIT_OFFSET", 500),
-		MaxParallelRequests: intEnv("MAX_PARALLEL_REQUESTS", 2),
-		MaxParallelBlocks:   intEnv("MAX_PARALLEL_BLOCKS", 5),
-		ChunkSize:           intEnv("CHUNK_SIZE", 1000),
-		RetryDelay:          time.Duration(intEnv("RETRY_DELAY", 1)) * time.Millisecond,
-		BetweenBlockDelay:   time.Duration(intEnv("BETWEEN_BLOCK_DELAY", 100)) * time.Millisecond,
+		ApiTonCenterKEY:     os.Getenv("API_TONCENTER_KEY"),      // TonCenter API key
+		ApiTonCenterBaseURL: os.Getenv("API_TONCENTER_BASE_URL"), // TonCenter API base URL
+		ApiTonCenterRPS:     intEnv("API_TONCENTER_RPS", 1),      // Rate limit per second for TonCenter API
+		ApiFetchLimit:       intEnv("API_FETCH_LIMIT", 200),      // TonCenter API fetch limit per request
+
+		BlocksSavePath:     os.Getenv("BLOCKS_SAVE_PATH"),                                   // Path to save fetched blocks
+		MaxSavedBlocks:     intEnv("MAX_SAVED_BLOCKS", 604800),                              // Maximum saved blocks
+		MaxParallelFetches: intEnv("MAX_PARALLEL_FETCHES", 1),                               // Maximum parallel fetches
+		DelayOnRetry:       time.Duration(intEnv("DELAY_ON_RETRY", 100)) * time.Millisecond, // Delay on retry if failed
+		DelayOnBlocks:      time.Duration(intEnv("DELAY_ON_BLOCKS", 10)) * time.Millisecond, // Delay on blocks fetch
 	}, nil
 }
 
+// Helper function to fetch int environment variables, with a default fallback
 func intEnv(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
 		if i, err := strconv.Atoi(value); err == nil {

@@ -5,9 +5,9 @@ import (
 	"log"
 	"time"
 
-	"ton-block-processor/internal/config"
-	"ton-block-processor/internal/processor"
-	"ton-block-processor/internal/utils"
+	"toncenter-block-cacher/internal/config"
+	"toncenter-block-cacher/internal/processor"
+	"toncenter-block-cacher/internal/utils"
 )
 
 func main() {

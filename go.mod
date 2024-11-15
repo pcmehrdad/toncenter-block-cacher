@@ -1,4 +1,4 @@
-module ton-block-processor
+module toncenter-block-cacher
 
 go 1.22.5
 
