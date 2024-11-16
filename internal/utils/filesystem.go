@@ -5,249 +5,138 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
-	"sync"
-	"time"
-
-	"toncenter-block-cacher/internal/models"
+	"strings"
 )
 
 type FileSystem struct {
-	basePath    string
-	mu          sync.RWMutex
-	blockCache  map[int]*blockMetadata
-	maxCacheAge time.Duration
-}
-
-type blockMetadata struct {
-	ProcessedAt    time.Time
-	LastUpdateTime time.Time
-	EventCount     int
+	basePath string
 }
 
 func NewFileSystem(basePath string) *FileSystem {
-	fs := &FileSystem{
-		basePath:    basePath,
-		blockCache:  make(map[int]*blockMetadata),
-		maxCacheAge: 5 * time.Minute,
-	}
-
-	// Ensure base directory exists
-	if err := os.MkdirAll(basePath, 0755); err != nil {
-		panic(fmt.Sprintf("failed to create base directory: %v", err))
-	}
-
-	// Load existing blocks into cache
-	fs.loadExistingBlocks()
-
-	// Start cache cleanup routine
-	go fs.cleanupRoutine()
-
-	return fs
+	return &FileSystem{basePath: basePath}
 }
 
-func (fs *FileSystem) loadExistingBlocks() {
-	entries, err := os.ReadDir(fs.basePath)
+func (fs *FileSystem) SaveBlock(blockNum int, data []byte) error {
+	filename := filepath.Join(fs.basePath, fmt.Sprintf("%d.json", blockNum))
+	return os.WriteFile(filename, data, 0644)
+}
+
+func (fs *FileSystem) GetLastBlock() (int, error) {
+	files, err := os.ReadDir(fs.basePath)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
 	}
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
+	var maxBlock int
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".json") {
 			continue
 		}
-
-		blockNum, err := strconv.Atoi(entry.Name())
+		blockNum, err := strconv.Atoi(strings.TrimSuffix(file.Name(), ".json"))
 		if err != nil {
 			continue
 		}
-
-		fs.blockCache[blockNum] = &blockMetadata{
-			ProcessedAt:    time.Now(),
-			LastUpdateTime: time.Now(),
+		if blockNum > maxBlock {
+			maxBlock = blockNum
 		}
 	}
+	return maxBlock, nil
 }
 
-func (fs *FileSystem) SaveBlockData(blockNum int, response *models.ChunkResponse) error {
-	dirPath := filepath.Join(fs.basePath, strconv.Itoa(blockNum))
-	tempDirPath := dirPath + "_temp"
-
-	// Create temp directory
-	if err := os.MkdirAll(tempDirPath, 0755); err != nil {
-		return fmt.Errorf("create temp dir: %w", err)
+func (fs *FileSystem) RemoveOldBlocks(keepLatest int) error {
+	files, err := os.ReadDir(fs.basePath)
+	if err != nil {
+		return err
 	}
 
-	// Cleanup function
-	cleanup := func() {
-		if err := os.RemoveAll(tempDirPath); err != nil {
-			fmt.Printf("Failed to remove temp directory: %v\n", err)
+	var blocks []int
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".json") {
+			continue
+		}
+		blockNum, err := strconv.Atoi(strings.TrimSuffix(file.Name(), ".json"))
+		if err != nil {
+			continue
+		}
+		blocks = append(blocks, blockNum)
+	}
+
+	if len(blocks) <= keepLatest {
+		return nil
+	}
+
+	sort.Ints(blocks)
+	for _, block := range blocks[:len(blocks)-keepLatest] {
+		if err := os.Remove(filepath.Join(fs.basePath, fmt.Sprintf("%d.json", block))); err != nil {
+			return err
 		}
 	}
-	defer cleanup()
-
-	// Prepare data
-	events, err := json.MarshalIndent(response.Chunk.Events, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal events: %w", err)
-	}
-
-	addresses, err := json.MarshalIndent(response.Chunk.AddressBook, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal addresses: %w", err)
-	}
-
-	// Write files
-	if err := os.WriteFile(filepath.Join(tempDirPath, "events.json"), events, 0644); err != nil {
-		return fmt.Errorf("write events: %w", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(tempDirPath, "addresses.json"), addresses, 0644); err != nil {
-		return fmt.Errorf("write addresses: %w", err)
-	}
-
-	// Atomic directory replacement
-	if err := os.RemoveAll(dirPath); err != nil {
-		return fmt.Errorf("remove old dir: %w", err)
-	}
-
-	if err := os.Rename(tempDirPath, dirPath); err != nil {
-		return fmt.Errorf("rename dir: %w", err)
-	}
-
-	// Update cache
-	fs.mu.Lock()
-	fs.blockCache[blockNum] = &blockMetadata{
-		ProcessedAt:    time.Now(),
-		LastUpdateTime: time.Now(),
-		EventCount:     len(response.Chunk.Events),
-	}
-	fs.mu.Unlock()
-
 	return nil
 }
 
-func (fs *FileSystem) GetLastSavedBlockNumber() (uint32, error) {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+func (fs *FileSystem) IsBlockValid(blockNum int) bool {
+	filename := filepath.Join(fs.basePath, fmt.Sprintf("%d.json", blockNum))
 
-	var lastBlock uint32
-	for blockNum := range fs.blockCache {
-		if uint32(blockNum) > lastBlock {
-			lastBlock = uint32(blockNum)
-		}
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return false
 	}
 
-	if lastBlock == 0 {
-		return 0, fmt.Errorf("no blocks found")
+	// Check if it's a valid JSON and has the expected structure
+	var response struct {
+		Events      []json.RawMessage      `json:"events"`
+		AddressBook map[string]interface{} `json:"address_book"`
 	}
 
-	return lastBlock, nil
+	if err := json.Unmarshal(data, &response); err != nil {
+		return false
+	}
+
+	// Check if basic structure is present
+	return response.Events != nil && response.AddressBook != nil
 }
 
-func (fs *FileSystem) RemoveBlocksBefore(blockNum int) error {
-	entries, err := os.ReadDir(fs.basePath)
+func (fs *FileSystem) ReadBlock(blockNum int) (json.RawMessage, error) {
+	filename := filepath.Join(fs.basePath, fmt.Sprintf("%d.json", blockNum))
+	data, err := os.ReadFile(filename)
 	if err != nil {
-		return fmt.Errorf("read directory: %w", err)
+		return nil, fmt.Errorf("read block file: %w", err)
+	}
+	return json.RawMessage(data), nil
+}
+
+func (fs *FileSystem) GetAvailableBlocks() ([]int, error) {
+	files, err := os.ReadDir(fs.basePath)
+	if err != nil {
+		return nil, fmt.Errorf("read directory: %w", err)
 	}
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
+	blocks := make([]int, 0, len(files))
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".json") {
 			continue
 		}
 
-		num, err := strconv.Atoi(entry.Name())
+		blockNum, err := strconv.Atoi(strings.TrimSuffix(file.Name(), ".json"))
 		if err != nil {
 			continue
 		}
 
-		if num < blockNum {
-			path := filepath.Join(fs.basePath, entry.Name())
-			if err := os.RemoveAll(path); err != nil {
-				return fmt.Errorf("remove block %d: %w", num, err)
-			}
-
-			fs.mu.Lock()
-			delete(fs.blockCache, num)
-			fs.mu.Unlock()
+		// Verify block is valid
+		if fs.IsBlockValid(blockNum) {
+			blocks = append(blocks, blockNum)
 		}
 	}
 
-	return nil
-}
-
-func (fs *FileSystem) cleanupRoutine() {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		fs.mu.Lock()
-		now := time.Now()
-		for blockNum, metadata := range fs.blockCache {
-			if now.Sub(metadata.LastUpdateTime) > fs.maxCacheAge {
-				delete(fs.blockCache, blockNum)
-			}
-		}
-		fs.mu.Unlock()
-	}
-}
-
-func (fs *FileSystem) GetBlockData(blockNum int) (*models.Response, error) {
-	dirPath := filepath.Join(fs.basePath, strconv.Itoa(blockNum))
-
-	// Check if block exists
-	fs.mu.RLock()
-	_, exists := fs.blockCache[blockNum]
-	fs.mu.RUnlock()
-
-	if !exists {
-		return nil, fmt.Errorf("block %d not found", blockNum)
+	if len(blocks) == 0 {
+		return nil, fmt.Errorf("no valid blocks found")
 	}
 
-	// Read events and addresses files
-	eventsPath := filepath.Join(dirPath, "events.json")
-	addressesPath := filepath.Join(dirPath, "address_book.json")
-
-	events, err := os.ReadFile(eventsPath)
-	if err != nil {
-		return nil, fmt.Errorf("read events: %w", err)
-	}
-
-	addresses, err := os.ReadFile(addressesPath)
-	if err != nil {
-		return nil, fmt.Errorf("read addresses: %w", err)
-	}
-
-	var response models.Response
-
-	if err := json.Unmarshal(events, &response.Events); err != nil {
-		return nil, fmt.Errorf("unmarshal events: %w", err)
-	}
-
-	if err := json.Unmarshal(addresses, &response.AddressBook); err != nil {
-		return nil, fmt.Errorf("unmarshal addresses: %w", err)
-	}
-
-	return &response, nil
-}
-
-func (fs *FileSystem) GetBlockRange(start, end int) ([]models.Response, error) {
-	if end < start {
-		return nil, fmt.Errorf("invalid range: end < start")
-	}
-
-	var responses []models.Response
-	for blockNum := start; blockNum <= end; blockNum++ {
-		response, err := fs.GetBlockData(blockNum)
-		if err != nil {
-			continue // Skip blocks that don't exist
-		}
-		responses = append(responses, *response)
-	}
-
-	if len(responses) == 0 {
-		return nil, fmt.Errorf("no blocks found in range %d-%d", start, end)
-	}
-
-	return responses, nil
+	sort.Ints(blocks)
+	return blocks, nil
 }

@@ -1,34 +1,122 @@
-# TON Block Processor
+# TON Center Block Cacher
 
-A Go application for processing TON blockchain blocks and storing their events data.
+A service that caches TON blockchain blocks from TON Center API, maintains a specified window of recent blocks, and provides HTTP endpoints for block data access.
 
-## Setup
+## Features
 
-1. Clone the repository
-2. Copy `.env.example` to `.env` and fill in your values
-3. Install dependencies: `go mod download`
-4. Build: `go build -o bin/processor cmd/processor/main.go`
-5. Run: `./bin/processor`
+- Continuously syncs blocks from TON Center API
+- Maintains a configurable window of recent blocks
+- Automatically cleans up old blocks
+- Provides HTTP endpoints for block data access
+- Handles network issues and retries automatically
+- Verifies block integrity periodically
 
 ## Configuration
 
-The application uses environment variables for configuration. See `.env.example` for available options.
+Create a `.env` file based on `.env.example`:
 
-## Project Structure
+```env
+# TON Center API Configuration
+API_TONCENTER_KEY=your_api_key_here
+API_TONCENTER_BASE_URL=https://toncenter.com/api/v3/events
+API_TONCENTER_RPS=8
+API_FETCH_LIMIT=500
 
-- `cmd/`: Application entrypoints
-- `internal/`: Internal packages
-  - `config/`: Configuration handling
-  - `models/`: Data structures
-  - `api/`: API client
-  - `processor/`: Block processing logic
-  - `utils/`: Utility functions
+# Storage Configuration
+BLOCKS_SAVE_PATH=./data/blocks
+MAX_SAVED_BLOCKS=604800  # Keep approximately 7 days of blocks
+MAX_PARALLEL_FETCHES=5
 
-## Future Improvements
+# Timing Configuration
+DELAY_ON_RETRY=100  # milliseconds
+DELAY_ON_BLOCKS=10  # milliseconds
 
-- Add current block number fetching from external source
-- Implement continuous processing of new blocks
-- Add metrics and monitoring
-- Add tests
-- Add logging system
-- Add CLI arguments for flexible configuration
+# HTTP Server Configuration
+HTTP_HOST=localhost
+HTTP_PORT=8080
+```
+
+## Building and Running
+
+### Using Docker
+
+1. Build the image:
+```bash
+docker build -t toncenter-block-cacher .
+```
+
+2. Run the container:
+```bash
+docker run -d \
+  -p 8080:8080 \
+  -v $(pwd)/data:/app/data \
+  --name toncenter-block-cacher \
+  toncenter-block-cacher
+```
+
+### Manual Build
+
+1. Install dependencies:
+```bash
+go mod download
+```
+
+2. Build:
+```bash
+go build -o toncenter-block-cacher ./cmd/processor
+```
+
+3. Run:
+```bash
+./toncenter-block-cacher
+```
+
+## HTTP Endpoints
+
+### Get Available Blocks
+```bash
+curl http://localhost:8080/blocks/available
+```
+Returns information about currently available blocks:
+```json
+{
+  "blocks": [12345, 12346, 12347, ...],
+  "count": 1000,
+  "first": 12345,
+  "last": 13345
+}
+```
+
+### Get Specific Block
+```bash
+curl http://localhost:8080/blocks/12345
+```
+Returns the specified block if available.
+
+### Get Block Range
+```bash
+curl "http://localhost:8080/blocks/range?start=12345&end=12350"
+```
+Returns blocks within the specified range (maximum 50 blocks).
+
+
+## Error Handling
+
+- The service automatically retries failed requests with exponential backoff
+- Invalid blocks are automatically repaired during periodic verification
+- HTTP endpoints return appropriate status codes and error messages
+
+## Monitoring
+
+The service logs important events including:
+- Block processing status
+- Sync progress
+- Error conditions
+- HTTP server status
+
+## Limitations
+
+- Maximum range request size is 50 blocks
+- Maintains only the configured number of recent blocks
+- Stays 5 blocks behind the chain head for finality
+- Rate limited according to TON Center API limitations

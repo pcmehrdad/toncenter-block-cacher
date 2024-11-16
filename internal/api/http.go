@@ -1,183 +1,146 @@
-// File: internal/api/http.go
-
 package api
 
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
-	"time"
+	"strings"
+	"sync"
 
-	"github.com/gorilla/mux"
-	"toncenter-block-cacher/internal/config"
 	"toncenter-block-cacher/internal/utils"
 )
 
 type Server struct {
-	fs     *utils.FileSystem
-	cfg    *config.Config
-	router *mux.Router
+	fs        *utils.FileSystem
+	lastBlock int
+	mu        sync.RWMutex
 }
 
-type HTTPResponse struct {
-	Success bool        `json:"success"`
-	Data    interface{} `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
-}
-
-func NewServer(fs *utils.FileSystem, cfg *config.Config) *Server {
-	s := &Server{
-		fs:     fs,
-		cfg:    cfg,
-		router: mux.NewRouter(),
+func NewServer(fs *utils.FileSystem) *Server {
+	return &Server{
+		fs: fs,
 	}
-	s.setupRoutes()
-	return s
 }
 
-func (s *Server) setupRoutes() {
-	// Add middleware
-	s.router.Use(loggingMiddleware)
-	s.router.Use(recoveryMiddleware)
-
-	// API routes
-	s.router.HandleFunc("/api/block/{number}", s.handleGetBlock).Methods("GET")
-	s.router.HandleFunc("/api/blocks/latest", s.handleGetLatestBlock).Methods("GET")
-	s.router.HandleFunc("/api/blocks/range", s.handleGetBlockRange).Methods("GET")
-	s.router.HandleFunc("/api/health", s.handleHealth).Methods("GET")
+func (s *Server) UpdateLastBlock(blockNum int) {
+	s.mu.Lock()
+	if blockNum > s.lastBlock {
+		s.lastBlock = blockNum
+	}
+	s.mu.Unlock()
 }
 
-func (s *Server) handleGetBlock(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	blockNum, err := strconv.Atoi(vars["number"])
-	if err != nil {
-		sendError(w, "Invalid block number", http.StatusBadRequest)
-		return
-	}
+func (s *Server) Start(addr string) error {
+	mux := http.NewServeMux()
 
-	response, err := s.fs.GetBlockData(blockNum)
-	if err != nil {
-		sendError(w, fmt.Sprintf("Block %d not found", blockNum), http.StatusNotFound)
-		return
-	}
+	// Get specific block
+	mux.HandleFunc("/blocks/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 
-	sendSuccess(w, map[string]interface{}{
-		"block_number": blockNum,
-		"data":         response,
+		parts := strings.Split(r.URL.Path, "/")
+		if len(parts) != 3 {
+			http.Error(w, "Invalid path", http.StatusBadRequest)
+			return
+		}
+
+		blockID := parts[2]
+
+		// Handle specific block
+		blockNum, err := strconv.Atoi(blockID)
+		if err != nil {
+			http.Error(w, "Invalid block number", http.StatusBadRequest)
+			return
+		}
+
+		data, err := s.fs.ReadBlock(blockNum)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error reading block %d: %v", blockNum, err), http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
 	})
-}
 
-func (s *Server) handleGetLatestBlock(w http.ResponseWriter, r *http.Request) {
-	lastBlock, err := s.fs.GetLastSavedBlockNumber()
-	if err != nil {
-		sendError(w, "No blocks available", http.StatusNotFound)
-		return
-	}
+	// Get range of blocks
+	mux.HandleFunc("/blocks/range", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 
-	response, err := s.fs.GetBlockData(int(lastBlock))
-	if err != nil {
-		sendError(w, "Latest block data not available", http.StatusNotFound)
-		return
-	}
+		startStr := r.URL.Query().Get("start")
+		endStr := r.URL.Query().Get("end")
 
-	sendSuccess(w, map[string]interface{}{
-		"block_number": lastBlock,
-		"data":         response,
-	})
-}
+		start, err := strconv.Atoi(startStr)
+		if err != nil {
+			http.Error(w, "Invalid start block", http.StatusBadRequest)
+			return
+		}
 
-func (s *Server) handleGetBlockRange(w http.ResponseWriter, r *http.Request) {
-	startStr := r.URL.Query().Get("start")
-	endStr := r.URL.Query().Get("end")
+		end, err := strconv.Atoi(endStr)
+		if err != nil {
+			http.Error(w, "Invalid end block", http.StatusBadRequest)
+			return
+		}
 
-	start, err := strconv.Atoi(startStr)
-	if err != nil {
-		sendError(w, "Invalid start block number", http.StatusBadRequest)
-		return
-	}
+		if end < start {
+			http.Error(w, "End block must be greater than start block", http.StatusBadRequest)
+			return
+		}
 
-	end, err := strconv.Atoi(endStr)
-	if err != nil {
-		sendError(w, "Invalid end block number", http.StatusBadRequest)
-		return
-	}
+		if end-start > 50 { // Limit range size
+			http.Error(w, "Range too large (maximum 50 blocks)", http.StatusBadRequest)
+			return
+		}
 
-	if end < start {
-		sendError(w, "End block must be greater than start block", http.StatusBadRequest)
-		return
-	}
-
-	if end-start > s.cfg.HTTPMaxRangeSize {
-		sendError(w, fmt.Sprintf("Range too large. Maximum range is %d blocks", s.cfg.HTTPMaxRangeSize), http.StatusBadRequest)
-		return
-	}
-
-	responses, err := s.fs.GetBlockRange(start, end)
-	if err != nil {
-		sendError(w, fmt.Sprintf("Error fetching blocks: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	sendSuccess(w, map[string]interface{}{
-		"start_block": start,
-		"end_block":   end,
-		"blocks":      responses,
-	})
-}
-
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	health := struct {
-		Status    string    `json:"status"`
-		Timestamp time.Time `json:"timestamp"`
-	}{
-		Status:    "OK",
-		Timestamp: time.Now(),
-	}
-	sendSuccess(w, health)
-}
-
-func (s *Server) GetRouter() *mux.Router {
-	return s.router
-}
-
-// Middleware
-func loggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		log.Printf("Started %s %s", r.Method, r.URL.Path)
-		next.ServeHTTP(w, r)
-		log.Printf("Completed %s %s in %v", r.Method, r.URL.Path, time.Since(start))
-	})
-}
-
-func recoveryMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				log.Printf("panic: %v", err)
-				sendError(w, "Internal server error", http.StatusInternalServerError)
+		blocks := make([]json.RawMessage, 0, end-start+1)
+		for i := start; i <= end; i++ {
+			data, err := s.fs.ReadBlock(i)
+			if err != nil {
+				continue // Skip missing blocks
 			}
-		}()
-		next.ServeHTTP(w, r)
-	})
-}
+			blocks = append(blocks, data)
+		}
 
-// Helper functions
-func sendSuccess(w http.ResponseWriter, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(HTTPResponse{
-		Success: true,
-		Data:    data,
-	})
-}
+		response := map[string]interface{}{
+			"blocks": blocks,
+			"count":  len(blocks),
+			"start":  start,
+			"end":    end,
+		}
 
-func sendError(w http.ResponseWriter, message string, code int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(HTTPResponse{
-		Success: false,
-		Error:   message,
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
 	})
+
+	// Get available blocks
+	mux.HandleFunc("/blocks/available", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		blocks, err := s.fs.GetAvailableBlocks()
+		if err != nil {
+			http.Error(w, "Error getting available blocks", http.StatusInternalServerError)
+			return
+		}
+
+		response := map[string]interface{}{
+			"blocks": blocks,
+			"count":  len(blocks),
+			"first":  blocks[0],
+			"last":   blocks[len(blocks)-1],
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	})
+
+	return http.ListenAndServe(addr, mux)
 }

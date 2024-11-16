@@ -1,0 +1,46 @@
+# Version control
+.git
+.gitignore
+
+# Development
+.env
+*.md
+LICENSE
+Makefile
+docker-compose.yml
+docker-compose.*.yml
+.dockerignore
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Build
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+toncenter-block-cacher
+
+# Test files
+*_test.go
+/test/
+*.test
+
+# Debug files
+__debug_bin
+
+# Data directory (will be mounted as volume)
+/data/
+/data/blocks/
+
+# Go specific
+vendor/
+
+# Logs
+*.log
