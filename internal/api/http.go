@@ -66,58 +66,6 @@ func (s *Server) Start(addr string) error {
 		w.Write(data)
 	})
 
-	// Get range of blocks
-	mux.HandleFunc("/blocks/range", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		startStr := r.URL.Query().Get("start")
-		endStr := r.URL.Query().Get("end")
-
-		start, err := strconv.Atoi(startStr)
-		if err != nil {
-			http.Error(w, "Invalid start block", http.StatusBadRequest)
-			return
-		}
-
-		end, err := strconv.Atoi(endStr)
-		if err != nil {
-			http.Error(w, "Invalid end block", http.StatusBadRequest)
-			return
-		}
-
-		if end < start {
-			http.Error(w, "End block must be greater than start block", http.StatusBadRequest)
-			return
-		}
-
-		if end-start > 50 { // Limit range size
-			http.Error(w, "Range too large (maximum 50 blocks)", http.StatusBadRequest)
-			return
-		}
-
-		blocks := make([]json.RawMessage, 0, end-start+1)
-		for i := start; i <= end; i++ {
-			data, err := s.fs.ReadBlock(i)
-			if err != nil {
-				continue // Skip missing blocks
-			}
-			blocks = append(blocks, data)
-		}
-
-		response := map[string]interface{}{
-			"blocks": blocks,
-			"count":  len(blocks),
-			"start":  start,
-			"end":    end,
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	})
-
 	// Get available blocks
 	mux.HandleFunc("/blocks/available", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
