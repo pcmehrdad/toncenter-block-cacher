@@ -1,0 +1,20 @@
+blocks
+transactions
+
+trace_id in 
+
+block_events :
+block -> traces -> actions(transactions)
+
+trace_id is main tx_id
+
+traces :
+	- trace_id
+	- ...
+actions :
+	- trace_id
+	- action_id (not useful!)
+	- type
+	- action_details
+	- "success": true,
+	- transaction_ids
