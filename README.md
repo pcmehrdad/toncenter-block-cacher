@@ -1,122 +1,192 @@
 # TON Center Block Cacher
 
-A service that caches TON blockchain blocks from TON Center API, maintains a specified window of recent blocks, and provides HTTP endpoints for block data access.
+A service that caches TON blockchain blocks from TON Center API, maintaining a configurable window of recent blocks with HTTP endpoints for data access.
 
 ## Features
 
-- Continuously syncs blocks from TON Center API
-- Maintains a configurable window of recent blocks
-- Automatically cleans up old blocks
-- Provides HTTP endpoints for block data access
-- Handles network issues and retries automatically
-- Verifies block integrity periodically
+- Continuous block syncing from TON Center API
+- Configurable block window size
+- Automatic cleanup of old blocks
+- Rate limiting for API requests
+- HTTP endpoints for block data access
+- Automatic recovery and retry mechanisms
+- Support for runtime configuration updates
 
-## Configuration
+## Quick Start
 
-Create a `.env` file based on `.env.example`:
+1. Clone the repository:
+```bash
+git clone https://github.com/pcmehrdad/toncenter-block-cacher.git
+cd toncenter-block-cacher
+```
 
+2. Create environment file:
+```bash
+cp .env.example .env
+```
+
+3. Configure your environment:
 ```env
+# Project Settings
+COMPOSE_PROJECT_NAME=toncenter-block-cacher
+UID=1000
+GID=1000
+DC_HTTP_PORT=8081
+
+# Storage Configuration
+BLOCKS_SAVE_PATH=./data/blocks
+
 # TON Center API Configuration
 API_TONCENTER_KEY=your_api_key_here
 API_TONCENTER_BASE_URL=https://toncenter.com/api/v3/events
 API_TONCENTER_RPS=8
 API_FETCH_LIMIT=500
 
-# Storage Configuration
-BLOCKS_SAVE_PATH=./data/blocks
-MAX_SAVED_BLOCKS=604800  # Keep approximately 7 days of blocks
+# Block Management
+MAX_SAVED_BLOCKS=200           # Number of blocks to keep
 MAX_PARALLEL_FETCHES=5
 
-# Timing Configuration
-DELAY_ON_RETRY=100  # milliseconds
-DELAY_ON_BLOCKS=10  # milliseconds
-
-# HTTP Server Configuration
-HTTP_HOST=localhost
-HTTP_PORT=8080
+# Timing Configuration (milliseconds)
+DELAY_ON_RETRY=100            # Delay before retrying failed fetches
+DELAY_ON_BLOCKS=10            # Delay between block fetches
 ```
 
-## Building and Running
-
-### Using Docker
-
-1. Build the image:
+4. Create required directories:
 ```bash
-docker build -t toncenter-block-cacher .
+mkdir -p data/blocks
 ```
 
-2. Run the container:
+5. Start the service:
 ```bash
-docker run -d \
-  -p 8080:8080 \
-  -v $(pwd)/data:/app/data \
-  --name toncenter-block-cacher \
-  toncenter-block-cacher
+docker-compose up -d
 ```
 
-### Manual Build
+## Docker Compose Usage
 
-1. Install dependencies:
+### Start Service
 ```bash
-go mod download
+docker-compose up -d
 ```
 
-2. Build:
+### View Logs
 ```bash
-go build -o toncenter-block-cacher ./cmd/processor
+docker-compose logs -f
 ```
 
-3. Run:
+### Stop Service
 ```bash
-./toncenter-block-cacher
+docker-compose down
+```
+
+### Reload Configuration
+To reload configuration after changing .env:
+```bash
+# Option 1: Send SIGHUP
+docker kill -s SIGHUP $(docker-compose ps -q)
+
+# Option 2: Restart container
+docker-compose restart
 ```
 
 ## HTTP Endpoints
 
-### Get Available Blocks
+### Get Latest Block Number
 ```bash
-curl http://localhost:8080/blocks/available
+curl http://localhost:8081/blocks/latest
 ```
-Returns information about currently available blocks:
+Response:
 ```json
 {
-  "blocks": [12345, 12346, 12347, ...],
-  "count": 1000,
-  "first": 12345,
-  "last": 13345
+    "block": 42064764
 }
 ```
 
 ### Get Specific Block
 ```bash
-curl http://localhost:8080/blocks/12345
+curl http://localhost:8081/blocks/42064764
 ```
-Returns the specified block if available.
 
-### Get Block Range
+### Get Available Blocks
 ```bash
-curl "http://localhost:8080/blocks/range?start=12345&end=12350"
+curl http://localhost:8081/blocks/available
 ```
-Returns blocks within the specified range (maximum 50 blocks).
+Response:
+```json
+{
+    "blocks": [42064564, 42064565, ..., 42064764],
+    "count": 200,
+    "first": 42064564,
+    "last": 42064764
+}
+```
 
+## Configuration Details
 
-## Error Handling
+### Block Management
+- `MAX_SAVED_BLOCKS`: Number of most recent blocks to keep
+    - Example: 200 for recent blocks
+    - Example: 604800 for approximately 7 days of blocks
 
-- The service automatically retries failed requests with exponential backoff
-- Invalid blocks are automatically repaired during periodic verification
-- HTTP endpoints return appropriate status codes and error messages
+### Rate Limiting
+- `API_TONCENTER_RPS`: Requests per second limit
+- `API_FETCH_LIMIT`: Maximum events per request
 
-## Monitoring
+### Timing
+- `DELAY_ON_RETRY`: Milliseconds to wait before retrying failed requests
+- `DELAY_ON_BLOCKS`: Milliseconds to wait between block fetches
 
-The service logs important events including:
-- Block processing status
-- Sync progress
-- Error conditions
-- HTTP server status
+### Docker Settings
+- `UID` and `GID`: User/Group IDs for file permissions
+- `DC_HTTP_PORT`: External HTTP port mapping
 
-## Limitations
+## Maintenance
 
-- Maximum range request size is 50 blocks
-- Maintains only the configured number of recent blocks
-- Stays 5 blocks behind the chain head for finality
-- Rate limited according to TON Center API limitations
+### Adjusting Block Window
+1. Update `MAX_SAVED_BLOCKS` in .env
+2. Either:
+    - Send SIGHUP to reload: `docker kill -s SIGHUP container_name`
+    - Or restart: `docker-compose restart`
+
+### Monitoring
+View logs:
+```bash
+# All logs
+docker-compose logs -f
+
+# Filter for specific events
+docker-compose logs -f | grep "Processed block"
+```
+
+### Data Management
+Block data location:
+```bash
+./data/blocks/           # Default location
+```
+
+## Troubleshooting
+
+1. If blocks are not being cleaned up:
+    - Check current block count: `ls data/blocks | wc -l`
+    - Verify MAX_SAVED_BLOCKS in .env
+    - Restart service or send SIGHUP
+
+2. Rate limiting issues:
+    - Check logs for API errors
+    - Adjust API_TONCENTER_RPS
+    - Verify API key validity
+
+3. Missing blocks:
+    - Check /blocks/available endpoint
+    - Verify file permissions
+    - Check logs for fetch errors
+
+## Contributing
+
+1. Fork the repository
+2. Create feature branch
+3. Commit changes
+4. Create Pull Request
+
+## License
+
+MIT License - see LICENSE file for details
