@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/xssnick/tonutils-go/liteclient"
@@ -25,6 +27,10 @@ const (
 )
 
 func main() {
+	// Channel for graceful shutdown and config reload
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -33,7 +39,11 @@ func main() {
 	// Initialize TON client
 	client := initTONClient()
 	fs := utils.NewFileSystem(cfg.BlocksSavePath)
-	apiClient := api.NewClient(cfg.ToncenterBaseURL, cfg.ToncenterAPIKey)
+	apiClient := api.NewClient(
+		cfg.ToncenterBaseURL,
+		cfg.ToncenterAPIKey,
+		cfg.ToncenterRPS,
+	)
 
 	if err := os.MkdirAll(cfg.BlocksSavePath, 0755); err != nil {
 		log.Fatalf("Failed to create data directory: %v", err)
@@ -55,6 +65,11 @@ func main() {
 	var processedMutex sync.RWMutex
 	lastVerifyTime := time.Now()
 
+	// Enforce initial cleanup based on config
+	if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
+		log.Printf("Initial cleanup error: %v", err)
+	}
+
 	if err := syncRange(apiClient, fs, startBlock, currentBlock, cfg); err != nil {
 		log.Printf("Initial sync error: %v", err)
 	}
@@ -69,6 +84,33 @@ func main() {
 	}()
 
 	var lastProcessedBlock int = currentBlock
+
+	// Config reload goroutine
+	go func() {
+		for sig := range sigChan {
+			switch sig {
+			case syscall.SIGHUP:
+				// Reload config
+				newCfg, err := config.LoadConfig()
+				if err != nil {
+					log.Printf("Error reloading config: %v", err)
+					continue
+				}
+
+				// Update config and enforce new block limit
+				cfg = newCfg
+				if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
+					log.Printf("Error enforcing new block limit: %v", err)
+				}
+				log.Printf("Configuration reloaded, enforced max blocks: %d", cfg.MaxSavedBlocks)
+
+			case syscall.SIGINT, syscall.SIGTERM:
+				log.Println("Shutting down gracefully...")
+				os.Exit(0)
+			}
+		}
+	}()
+
 	for {
 		master, err := client.GetMasterchainInfo(context.Background())
 		if err != nil {
@@ -78,7 +120,7 @@ func main() {
 		}
 
 		targetBlock := int(master.SeqNo) - BLOCK_LAG
-		httpServer.UpdateLastBlock(targetBlock) // Update HTTP server with latest block
+		httpServer.UpdateLastBlock(targetBlock)
 
 		if targetBlock > lastProcessedBlock {
 			newBlocks := make([]int, 0, targetBlock-lastProcessedBlock)
@@ -97,6 +139,11 @@ func main() {
 				processedMutex.Unlock()
 				lastProcessedBlock = blockNum
 				log.Printf("Processed block %d", blockNum)
+			}
+
+			// Clean up after processing new blocks
+			if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
+				log.Printf("Error cleaning old blocks: %v", err)
 			}
 		}
 
@@ -129,13 +176,14 @@ func main() {
 				}
 			}
 			lastVerifyTime = time.Now()
+
+			// Clean up after verification
+			if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
+				log.Printf("Error cleaning old blocks: %v", err)
+			}
 		}
 
-		// Cleanup operations
-		if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
-			log.Printf("Error cleaning old blocks: %v", err)
-		}
-
+		// Clean up processed blocks map
 		processedMutex.Lock()
 		for blockNum := range processedBlocks {
 			if blockNum < targetBlock-cfg.MaxSavedBlocks {
