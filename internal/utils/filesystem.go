@@ -10,101 +10,114 @@ import (
 
 type FileSystem struct {
 	basePath string
-	cache    struct {
-		sync.RWMutex
-		blocks map[int]bool
-	}
+	mu       sync.RWMutex
+	blocks   map[int]bool
 }
 
 func NewFileSystem(basePath string) *FileSystem {
 	fs := &FileSystem{
 		basePath: basePath,
+		blocks:   make(map[int]bool),
 	}
-	fs.cache.blocks = make(map[int]bool)
+
+	// Initialize cache with existing blocks
+	if entries, err := os.ReadDir(basePath); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				if num, err := strconv.Atoi(entry.Name()); err == nil {
+					fs.blocks[num] = true
+				}
+			}
+		}
+	}
+
 	return fs
 }
 
 func (fs *FileSystem) GetLastSavedBlockNumber() (uint32, error) {
-	// Read the directory where blocks are saved
 	entries, err := os.ReadDir(fs.basePath)
 	if err != nil {
-		return 0, fmt.Errorf("unable to read directory %s: %v", fs.basePath, err)
+		return 0, fmt.Errorf("unable to read directory %s: %w", fs.basePath, err)
 	}
 
 	var lastBlockNumber uint32
-
-	// Iterate over the directory entries and find the highest block number
 	for _, entry := range entries {
-		if entry.IsDir() {
-			blockNumber, err := strconv.Atoi(entry.Name())
-			if err != nil {
-				continue
-			}
+		if !entry.IsDir() {
+			continue
+		}
 
-			if uint32(blockNumber) > lastBlockNumber {
-				lastBlockNumber = uint32(blockNumber)
-			}
+		blockNumber, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+
+		if uint32(blockNumber) > lastBlockNumber {
+			lastBlockNumber = uint32(blockNumber)
 		}
 	}
 
 	return lastBlockNumber, nil
 }
 
-// SaveBlockData saves the block data to the filesystem
 func (fs *FileSystem) SaveBlockData(blockNum int, events []byte, addresses []byte) error {
 	dirPath := filepath.Join(fs.basePath, strconv.Itoa(blockNum))
 	tempDirPath := dirPath + "_temp"
 
+	// Create temp directory
 	if err := os.MkdirAll(tempDirPath, 0755); err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
 
+	// Cleanup function for error cases
+	cleanup := func() {
+		if err := os.RemoveAll(tempDirPath); err != nil {
+			fmt.Printf("failed to remove temp directory: %v\n", err)
+		}
+	}
+
 	// Write files concurrently
+	errChan := make(chan error, 2)
 	var wg sync.WaitGroup
-	var eventErr, addrErr error
 
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		eventErr = os.WriteFile(filepath.Join(tempDirPath, "events.txt"), events, 0644)
+		if err := os.WriteFile(filepath.Join(tempDirPath, "events.txt"), events, 0644); err != nil {
+			errChan <- fmt.Errorf("save events: %w", err)
+		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		addrErr = os.WriteFile(filepath.Join(tempDirPath, "address_book.txt"), addresses, 0644)
+		if err := os.WriteFile(filepath.Join(tempDirPath, "address_book.txt"), addresses, 0644); err != nil {
+			errChan <- fmt.Errorf("save addresses: %w", err)
+		}
 	}()
 
 	wg.Wait()
+	close(errChan)
 
-	if eventErr != nil || addrErr != nil {
-		if err := os.RemoveAll(tempDirPath); err != nil {
-			fmt.Printf("failed to remove temp directory: %v\n", err)
-		}
-		if eventErr != nil {
-			return fmt.Errorf("save events: %w", eventErr)
-		}
-		return fmt.Errorf("save addresses: %w", addrErr)
+	// Check for errors
+	for err := range errChan {
+		cleanup()
+		return err
 	}
 
-	// Atomically replace the old directory with the new one
+	// Atomic replacement
 	if err := os.RemoveAll(dirPath); err != nil {
-		if err := os.RemoveAll(tempDirPath); err != nil {
-			fmt.Printf("failed to remove temp directory: %v\n", err)
-		}
+		cleanup()
 		return fmt.Errorf("remove old dir: %w", err)
 	}
 
 	if err := os.Rename(tempDirPath, dirPath); err != nil {
-		if err := os.RemoveAll(tempDirPath); err != nil {
-			fmt.Printf("failed to remove temp directory: %v\n", err)
-		}
+		cleanup()
 		return fmt.Errorf("rename dir: %w", err)
 	}
 
 	// Update cache
-	fs.cache.Lock()
-	fs.cache.blocks[blockNum] = true
-	fs.cache.Unlock()
+	fs.mu.Lock()
+	fs.blocks[blockNum] = true
+	fs.mu.Unlock()
 
 	return nil
 }
@@ -131,12 +144,23 @@ func (fs *FileSystem) RemoveBlocksBefore(blockNum int) error {
 				return fmt.Errorf("remove block %d failed: %w", num, err)
 			}
 
-			// Update cache
-			fs.cache.Lock()
-			delete(fs.cache.blocks, num)
-			fs.cache.Unlock()
+			fs.mu.Lock()
+			delete(fs.blocks, num)
+			fs.mu.Unlock()
 		}
 	}
 
 	return nil
+}
+
+// Helper method to check if a block exists
+func (fs *FileSystem) BlockExists(blockNum int) bool {
+	fs.mu.RLock()
+	exists := fs.blocks[blockNum]
+	fs.mu.RUnlock()
+	return exists
+}
+
+func (fs *FileSystem) GetBasePath() string {
+	return fs.basePath
 }

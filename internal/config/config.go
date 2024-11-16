@@ -9,15 +9,27 @@ import (
 )
 
 type Config struct {
+	// API Configuration
 	ApiTonCenterKEY     string
 	ApiTonCenterBaseURL string
 	ApiTonCenterRPS     int
 	ApiFetchLimit       int
-	BlocksSavePath      string
-	MaxSavedBlocks      int
-	MaxParallelFetches  int
-	DelayOnRetry        time.Duration
-	DelayOnBlocks       time.Duration
+
+	// Storage Configuration
+	BlocksSavePath string
+	MaxSavedBlocks int
+
+	// Processing Configuration
+	MaxParallelFetches int
+	DelayOnRetry       time.Duration
+	DelayOnBlocks      time.Duration
+
+	// HTTP Server Configuration
+	HTTPHost         string
+	HTTPPort         string
+	HTTPReadTimeout  time.Duration
+	HTTPWriteTimeout time.Duration
+	HTTPMaxRangeSize int
 }
 
 func LoadConfig() (*Config, error) {
@@ -26,27 +38,45 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 
-	// Return the configuration struct with updated variable names and static values
 	return &Config{
-		ApiTonCenterKEY:     os.Getenv("API_TONCENTER_KEY"),      // TonCenter API key
-		ApiTonCenterBaseURL: os.Getenv("API_TONCENTER_BASE_URL"), // TonCenter API base URL
-		ApiTonCenterRPS:     intEnv("API_TONCENTER_RPS", 1),      // Rate limit per second for TonCenter API
-		ApiFetchLimit:       intEnv("API_FETCH_LIMIT", 200),      // TonCenter API fetch limit per request
+		// API Configuration
+		ApiTonCenterKEY:     os.Getenv("API_TONCENTER_KEY"),
+		ApiTonCenterBaseURL: os.Getenv("API_TONCENTER_BASE_URL"),
+		ApiTonCenterRPS:     intEnv("API_TONCENTER_RPS", 1),
+		ApiFetchLimit:       intEnv("API_FETCH_LIMIT", 200),
 
-		BlocksSavePath:     os.Getenv("BLOCKS_SAVE_PATH"),                                   // Path to save fetched blocks
-		MaxSavedBlocks:     intEnv("MAX_SAVED_BLOCKS", 604800),                              // Maximum saved blocks
-		MaxParallelFetches: intEnv("MAX_PARALLEL_FETCHES", 1),                               // Maximum parallel fetches
-		DelayOnRetry:       time.Duration(intEnv("DELAY_ON_RETRY", 100)) * time.Millisecond, // Delay on retry if failed
-		DelayOnBlocks:      time.Duration(intEnv("DELAY_ON_BLOCKS", 10)) * time.Millisecond, // Delay on blocks fetch
+		// Storage Configuration
+		BlocksSavePath: os.Getenv("BLOCKS_SAVE_PATH"),
+		MaxSavedBlocks: intEnv("MAX_SAVED_BLOCKS", 604800),
+
+		// Processing Configuration
+		MaxParallelFetches: intEnv("MAX_PARALLEL_FETCHES", 5),
+		DelayOnRetry:       time.Duration(intEnv("DELAY_ON_RETRY", 100)) * time.Millisecond,
+		DelayOnBlocks:      time.Duration(intEnv("DELAY_ON_BLOCKS", 10)) * time.Millisecond,
+
+		// HTTP Server Configuration
+		HTTPHost:         getEnv("HTTP_HOST", "localhost"),
+		HTTPPort:         getEnv("HTTP_PORT", "8080"),
+		HTTPReadTimeout:  time.Duration(intEnv("HTTP_READ_TIMEOUT", 30)) * time.Second,
+		HTTPWriteTimeout: time.Duration(intEnv("HTTP_WRITE_TIMEOUT", 30)) * time.Second,
+		HTTPMaxRangeSize: intEnv("HTTP_MAX_RANGE_SIZE", 10000),
 	}, nil
 }
 
-// Helper function to fetch int environment variables, with a default fallback
+// Helper function to fetch int environment variables with default fallback
 func intEnv(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
 		if i, err := strconv.Atoi(value); err == nil {
 			return i
 		}
+	}
+	return defaultValue
+}
+
+// Helper function to fetch string environment variables with default fallback
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
 	return defaultValue
 }

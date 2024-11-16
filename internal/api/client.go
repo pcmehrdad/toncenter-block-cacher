@@ -1,3 +1,5 @@
+// File: internal/api/client.go
+
 package api
 
 import (
@@ -6,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"sync"
-	"time"
 
 	"toncenter-block-cacher/internal/models"
 	"toncenter-block-cacher/internal/utils"
@@ -18,7 +19,6 @@ type Client struct {
 	rateLimiters []*utils.RateLimiter
 	currentKey   int
 	mu           sync.Mutex
-	client       *http.Client
 }
 
 func NewClient(baseURL string, apiKeys []string, rateLimitPerKey int) *Client {
@@ -31,9 +31,6 @@ func NewClient(baseURL string, apiKeys []string, rateLimitPerKey int) *Client {
 		baseURL:      baseURL,
 		apiKeys:      apiKeys,
 		rateLimiters: rateLimiters,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
 	}
 }
 
@@ -55,11 +52,15 @@ func (c *Client) FetchChunk(mcSeqno, limit, offset int) (*models.ChunkResponse, 
 	url := fmt.Sprintf("%s?api_key=%s&mc_seqno=%d&limit=%d&offset=%d&sort=asc",
 		c.baseURL, apiKey, mcSeqno, limit, offset)
 
-	resp, err := c.client.Get(url)
+	resp, err := http.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("404: block not found")
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -74,6 +75,14 @@ func (c *Client) FetchChunk(mcSeqno, limit, offset int) (*models.ChunkResponse, 
 	var chunk models.Response
 	if err := json.Unmarshal(body, &chunk); err != nil {
 		return nil, fmt.Errorf("JSON unmarshaling failed: %w", err)
+	}
+
+	// Initialize empty maps if they're nil
+	if chunk.Events == nil {
+		chunk.Events = make([]models.Event, 0)
+	}
+	if chunk.AddressBook == nil {
+		chunk.AddressBook = make(map[string]models.AddressInfo)
 	}
 
 	return &models.ChunkResponse{
