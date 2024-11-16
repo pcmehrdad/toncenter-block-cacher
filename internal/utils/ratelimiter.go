@@ -1,41 +1,76 @@
 package utils
 
 import (
+	"sync"
 	"time"
 )
 
 type RateLimiter struct {
-	tick    *time.Ticker
-	stopCh  chan struct{}
-	tokenCh chan struct{}
+	tokensPerSecond int
+	tokenCh         chan struct{}
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
+	mu              sync.RWMutex
+	stopped         bool
 }
 
-func NewRateLimiter(ratePerSecond int) *RateLimiter {
-	rl := &RateLimiter{
-		tick:    time.NewTicker(time.Second / time.Duration(ratePerSecond)),
-		stopCh:  make(chan struct{}),
-		tokenCh: make(chan struct{}),
+func NewRateLimiter(tokensPerSecond int) *RateLimiter {
+	if tokensPerSecond <= 0 {
+		tokensPerSecond = 1
 	}
+
+	rl := &RateLimiter{
+		tokensPerSecond: tokensPerSecond,
+		tokenCh:         make(chan struct{}, tokensPerSecond),
+		stopCh:          make(chan struct{}),
+	}
+
+	rl.wg.Add(1)
 	go rl.run()
+
 	return rl
 }
 
 func (rl *RateLimiter) run() {
-	defer close(rl.tokenCh)
-	for {
+	defer rl.wg.Done()
+
+	interval := time.Second / time.Duration(rl.tokensPerSecond)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Initial fill
+	for i := 0; i < rl.tokensPerSecond; i++ {
 		select {
+		case rl.tokenCh <- struct{}{}:
 		case <-rl.stopCh:
 			return
-		case <-rl.tick.C:
-			rl.tokenCh <- struct{}{}
+		}
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			select {
+			case rl.tokenCh <- struct{}{}:
+			default:
+				// Channel is full, skip
+			}
+		case <-rl.stopCh:
+			return
 		}
 	}
 }
 
-func (rl *RateLimiter) Stop() {
-	close(rl.stopCh)
+func (rl *RateLimiter) WaitC() <-chan struct{} {
+	return rl.tokenCh
 }
 
-func (rl *RateLimiter) Wait() {
-	<-rl.tokenCh
+func (rl *RateLimiter) Stop() {
+	rl.mu.Lock()
+	if !rl.stopped {
+		close(rl.stopCh)
+		rl.stopped = true
+	}
+	rl.mu.Unlock()
+	rl.wg.Wait()
 }

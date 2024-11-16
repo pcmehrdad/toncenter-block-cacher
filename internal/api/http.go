@@ -7,25 +7,24 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strconv"
-	"toncenter-block-cacher/internal/config"
+	"time"
 
 	"github.com/gorilla/mux"
+	"toncenter-block-cacher/internal/config"
 	"toncenter-block-cacher/internal/utils"
 )
-
-type BlockResponse struct {
-	BlockNumber int             `json:"block_number"`
-	Events      json.RawMessage `json:"events,omitempty"`
-	Addresses   json.RawMessage `json:"addresses,omitempty"`
-	Error       string          `json:"error,omitempty"`
-}
 
 type Server struct {
 	fs     *utils.FileSystem
 	cfg    *config.Config
 	router *mux.Router
+}
+
+type HTTPResponse struct {
+	Success bool        `json:"success"`
+	Data    interface{} `json:"data,omitempty"`
+	Error   string      `json:"error,omitempty"`
 }
 
 func NewServer(fs *utils.FileSystem, cfg *config.Config) *Server {
@@ -38,26 +37,19 @@ func NewServer(fs *utils.FileSystem, cfg *config.Config) *Server {
 	return s
 }
 
-func (s *Server) GetRouter() *mux.Router {
-	return s.router
-}
-
 func (s *Server) setupRoutes() {
-	s.router.HandleFunc("/blocks/{number}", s.GetBlock).Methods("GET")
-	s.router.HandleFunc("/blocks/latest", s.GetLatestBlock).Methods("GET")
-	s.router.HandleFunc("/blocks/range", s.GetBlockRange).Methods("GET")
-
-	// Add middleware for logging and recovery
+	// Add middleware
 	s.router.Use(loggingMiddleware)
 	s.router.Use(recoveryMiddleware)
+
+	// API routes
+	s.router.HandleFunc("/api/block/{number}", s.handleGetBlock).Methods("GET")
+	s.router.HandleFunc("/api/blocks/latest", s.handleGetLatestBlock).Methods("GET")
+	s.router.HandleFunc("/api/blocks/range", s.handleGetBlockRange).Methods("GET")
+	s.router.HandleFunc("/api/health", s.handleHealth).Methods("GET")
 }
 
-func (s *Server) Start(port string) error {
-	log.Printf("Starting HTTP server on port %s", port)
-	return http.ListenAndServe(":"+port, s.router)
-}
-
-func (s *Server) GetBlock(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetBlock(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	blockNum, err := strconv.Atoi(vars["number"])
 	if err != nil {
@@ -65,44 +57,32 @@ func (s *Server) GetBlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	events, addresses, err := s.readBlockData(blockNum)
+	data, err := s.fs.GetBlockData(blockNum)
 	if err != nil {
 		sendError(w, fmt.Sprintf("Block %d not found", blockNum), http.StatusNotFound)
 		return
 	}
 
-	response := BlockResponse{
-		BlockNumber: blockNum,
-		Events:      events,
-		Addresses:   addresses,
-	}
-
-	sendJSON(w, response)
+	sendSuccess(w, data)
 }
 
-func (s *Server) GetLatestBlock(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetLatestBlock(w http.ResponseWriter, r *http.Request) {
 	lastBlock, err := s.fs.GetLastSavedBlockNumber()
 	if err != nil {
-		sendError(w, "Error getting latest block", http.StatusInternalServerError)
+		sendError(w, "No blocks available", http.StatusNotFound)
 		return
 	}
 
-	events, addresses, err := s.readBlockData(int(lastBlock))
+	data, err := s.fs.GetBlockData(int(lastBlock))
 	if err != nil {
 		sendError(w, "Latest block data not available", http.StatusNotFound)
 		return
 	}
 
-	response := BlockResponse{
-		BlockNumber: int(lastBlock),
-		Events:      events,
-		Addresses:   addresses,
-	}
-
-	sendJSON(w, response)
+	sendSuccess(w, data)
 }
 
-func (s *Server) GetBlockRange(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGetBlockRange(w http.ResponseWriter, r *http.Request) {
 	startStr := r.URL.Query().Get("start")
 	endStr := r.URL.Query().Get("end")
 
@@ -119,88 +99,75 @@ func (s *Server) GetBlockRange(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if end < start {
-		sendError(w, "End block must be greater than or equal to start block", http.StatusBadRequest)
+		sendError(w, "End block must be greater than start block", http.StatusBadRequest)
 		return
 	}
 
-	// Use config for range limit
 	if end-start > s.cfg.HTTPMaxRangeSize {
 		sendError(w, fmt.Sprintf("Range too large. Maximum range is %d blocks", s.cfg.HTTPMaxRangeSize), http.StatusBadRequest)
 		return
 	}
 
-	var responses []BlockResponse
-	for blockNum := start; blockNum <= end; blockNum++ {
-		events, addresses, err := s.readBlockData(blockNum)
-		if err != nil {
-			continue // Skip blocks that don't exist
-		}
-
-		responses = append(responses, BlockResponse{
-			BlockNumber: blockNum,
-			Events:      events,
-			Addresses:   addresses,
-		})
-	}
-
-	if len(responses) == 0 {
-		sendError(w, "No blocks found in specified range", http.StatusNotFound)
+	blocks, err := s.fs.GetBlockRange(start, end)
+	if err != nil {
+		sendError(w, "Error fetching blocks", http.StatusInternalServerError)
 		return
 	}
 
-	sendJSON(w, responses)
+	sendSuccess(w, blocks)
 }
 
-func (s *Server) readBlockData(blockNum int) (json.RawMessage, json.RawMessage, error) {
-	eventsPath := fmt.Sprintf("%s/%d/events.txt", s.fs.GetBasePath(), blockNum)
-	addressesPath := fmt.Sprintf("%s/%d/address_book.txt", s.fs.GetBasePath(), blockNum)
-
-	events, err := os.ReadFile(eventsPath)
-	if err != nil {
-		return nil, nil, err
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	health := struct {
+		Status    string    `json:"status"`
+		Timestamp time.Time `json:"timestamp"`
+	}{
+		Status:    "OK",
+		Timestamp: time.Now(),
 	}
-
-	addresses, err := os.ReadFile(addressesPath)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return events, addresses, nil
+	sendSuccess(w, health)
 }
 
-// Helper functions for HTTP responses
-func sendJSON(w http.ResponseWriter, data interface{}) {
+func (s *Server) GetRouter() *mux.Router {
+	return s.router
+}
+
+// Middleware
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		log.Printf("Started %s %s", r.Method, r.URL.Path)
+		next.ServeHTTP(w, r)
+		log.Printf("Completed %s %s in %v", r.Method, r.URL.Path, time.Since(start))
+	})
+}
+
+func recoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("panic: %v", err)
+				sendError(w, "Internal server error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Helper functions
+func sendSuccess(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Printf("Error encoding response: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-	}
+	json.NewEncoder(w).Encode(HTTPResponse{
+		Success: true,
+		Data:    data,
+	})
 }
 
 func sendError(w http.ResponseWriter, message string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	response := BlockResponse{Error: message}
-	json.NewEncoder(w).Encode(response)
-}
-
-// Middleware for logging
-func loggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Request: %s %s", r.Method, r.URL.Path)
-		next.ServeHTTP(w, r)
-	})
-}
-
-// Middleware for panic recovery
-func recoveryMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				log.Printf("Panic: %v", err)
-				http.Error(w, "Internal server error", http.StatusInternalServerError)
-			}
-		}()
-		next.ServeHTTP(w, r)
+	json.NewEncoder(w).Encode(HTTPResponse{
+		Success: false,
+		Error:   message,
 	})
 }
