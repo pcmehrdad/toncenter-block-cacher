@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"toncenter-block-cacher/internal/models"
 	"toncenter-block-cacher/internal/utils"
@@ -17,6 +18,7 @@ type Client struct {
 	rateLimiters []*utils.RateLimiter
 	currentKey   int
 	mu           sync.Mutex
+	client       *http.Client
 }
 
 func NewClient(baseURL string, apiKeys []string, rateLimitPerKey int) *Client {
@@ -29,6 +31,9 @@ func NewClient(baseURL string, apiKeys []string, rateLimitPerKey int) *Client {
 		baseURL:      baseURL,
 		apiKeys:      apiKeys,
 		rateLimiters: rateLimiters,
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+		},
 	}
 }
 
@@ -50,20 +55,25 @@ func (c *Client) FetchChunk(mcSeqno, limit, offset int) (*models.ChunkResponse, 
 	url := fmt.Sprintf("%s?api_key=%s&mc_seqno=%d&limit=%d&offset=%d&sort=asc",
 		c.baseURL, apiKey, mcSeqno, limit, offset)
 
-	resp, err := http.Get(url)
+	resp, err := c.client.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %v", err)
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("bad status: %d, body: %s", resp.StatusCode, string(body))
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("reading response failed: %v", err)
+		return nil, fmt.Errorf("reading response failed: %w", err)
 	}
 
 	var chunk models.Response
 	if err := json.Unmarshal(body, &chunk); err != nil {
-		return nil, fmt.Errorf("JSON unmarshaling failed: %v", err)
+		return nil, fmt.Errorf("JSON unmarshaling failed: %w", err)
 	}
 
 	return &models.ChunkResponse{
