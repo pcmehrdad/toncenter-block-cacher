@@ -57,13 +57,16 @@ func (s *Server) handleGetBlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := s.fs.GetBlockData(blockNum)
+	response, err := s.fs.GetBlockData(blockNum)
 	if err != nil {
 		sendError(w, fmt.Sprintf("Block %d not found", blockNum), http.StatusNotFound)
 		return
 	}
 
-	sendSuccess(w, data)
+	sendSuccess(w, map[string]interface{}{
+		"block_number": blockNum,
+		"data":         response,
+	})
 }
 
 func (s *Server) handleGetLatestBlock(w http.ResponseWriter, r *http.Request) {
@@ -73,13 +76,16 @@ func (s *Server) handleGetLatestBlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := s.fs.GetBlockData(int(lastBlock))
+	response, err := s.fs.GetBlockData(int(lastBlock))
 	if err != nil {
 		sendError(w, "Latest block data not available", http.StatusNotFound)
 		return
 	}
 
-	sendSuccess(w, data)
+	sendSuccess(w, map[string]interface{}{
+		"block_number": lastBlock,
+		"data":         response,
+	})
 }
 
 func (s *Server) handleGetBlockRange(w http.ResponseWriter, r *http.Request) {
@@ -108,13 +114,17 @@ func (s *Server) handleGetBlockRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	blocks, err := s.fs.GetBlockRange(start, end)
+	responses, err := s.fs.GetBlockRange(start, end)
 	if err != nil {
-		sendError(w, "Error fetching blocks", http.StatusInternalServerError)
+		sendError(w, fmt.Sprintf("Error fetching blocks: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	sendSuccess(w, blocks)
+	sendSuccess(w, map[string]interface{}{
+		"start_block": start,
+		"end_block":   end,
+		"blocks":      responses,
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

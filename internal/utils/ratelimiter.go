@@ -28,6 +28,11 @@ func NewRateLimiter(tokensPerSecond int) *RateLimiter {
 	rl.wg.Add(1)
 	go rl.run()
 
+	// Initial fill of tokens
+	for i := 0; i < tokensPerSecond; i++ {
+		rl.tokenCh <- struct{}{}
+	}
+
 	return rl
 }
 

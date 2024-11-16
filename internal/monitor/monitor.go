@@ -87,7 +87,9 @@ func (m *Monitor) Start() error {
 
 	// Start main monitoring loop
 	m.wg.Add(1)
-	go m.monitorBlocks(startBlock)
+	go func() {
+		m.monitorBlocks(startBlock)
+	}()
 
 	return nil
 }
@@ -119,6 +121,7 @@ func (m *Monitor) determineStartBlock() (uint32, error) {
 
 func (m *Monitor) monitorBlocks(startBlock uint32) {
 	defer m.wg.Done()
+	log.Printf("Starting to monitor blocks from %d", startBlock)
 
 	lastProcessed := startBlock - 1
 	ticker := time.NewTicker(200 * time.Millisecond)
@@ -134,6 +137,7 @@ func (m *Monitor) monitorBlocks(startBlock uint32) {
 			master, err := m.getCurrentBlock()
 			if err != nil {
 				log.Printf("Error getting current block: %v", err)
+				time.Sleep(time.Second) // Add delay on error
 				continue
 			}
 
@@ -147,16 +151,12 @@ func (m *Monitor) monitorBlocks(startBlock uint32) {
 			for blockNum := lastProcessed + 1; blockNum <= safeBlock; blockNum++ {
 				select {
 				case m.processingQueue <- blockNum:
+					log.Printf("Queued block %d for processing", blockNum)
 					lastProcessed = blockNum
 				case <-m.ctx.Done():
 					close(m.processingQueue)
 					return
 				}
-			}
-
-			// Cleanup old blocks
-			if err := m.cleanupOldBlocks(master.SeqNo); err != nil {
-				log.Printf("Error cleaning old blocks: %v", err)
 			}
 		}
 	}
@@ -175,18 +175,16 @@ func (m *Monitor) blockProcessor() {
 				return
 			}
 
+			log.Printf("Processing block %d", blockNum)
 			if err := m.processBlockWithRetries(blockNum); err != nil {
 				m.stats.Lock()
 				m.stats.failedCount++
 				m.stats.Unlock()
-				m.errorBlocks <- blockNum
 				log.Printf("Failed to process block %d: %v", blockNum, err)
 				continue
 			}
 
-			m.processedBlocks <- blockNum
 			m.updateStats(blockNum)
-
 			time.Sleep(m.cfg.BlockDelay)
 		}
 	}
@@ -211,15 +209,24 @@ func (m *Monitor) processBlockWithRetries(blockNum uint32) error {
 }
 
 func (m *Monitor) processBlock(blockNum uint32) error {
-	resp, err := m.api.FetchChunk(m.ctx, int(blockNum), m.cfg.FetchLimit, 0)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
+	defer cancel()
+
+	resp, err := m.api.FetchChunk(ctx, int(blockNum), m.cfg.FetchLimit, 0)
 	if err != nil {
 		return fmt.Errorf("fetch failed: %w", err)
+	}
+
+	// Add validation for empty response
+	if resp == nil || len(resp.Chunk.Events) == 0 {
+		return fmt.Errorf("no events found for block %d", blockNum)
 	}
 
 	if err := m.fs.SaveBlockData(int(blockNum), resp); err != nil {
 		return fmt.Errorf("save failed: %w", err)
 	}
 
+	log.Printf("Successfully processed and saved block %d", blockNum)
 	return nil
 }
 
@@ -302,8 +309,20 @@ func (m *Monitor) updateDisplay() {
 func (m *Monitor) Stop() {
 	log.Println("Stopping monitor...")
 	m.cancel()
-	m.wg.Wait()
-	log.Println("Monitor stopped")
+
+	// Add timeout for graceful shutdown
+	done := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("Monitor stopped gracefully")
+	case <-time.After(10 * time.Second):
+		log.Println("Monitor stop timed out")
+	}
 }
 
 func (m *Monitor) GetStats() struct {

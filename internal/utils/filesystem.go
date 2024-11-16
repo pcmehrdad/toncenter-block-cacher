@@ -191,3 +191,63 @@ func (fs *FileSystem) cleanupRoutine() {
 		fs.mu.Unlock()
 	}
 }
+
+func (fs *FileSystem) GetBlockData(blockNum int) (*models.Response, error) {
+	dirPath := filepath.Join(fs.basePath, strconv.Itoa(blockNum))
+
+	// Check if block exists
+	fs.mu.RLock()
+	_, exists := fs.blockCache[blockNum]
+	fs.mu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("block %d not found", blockNum)
+	}
+
+	// Read events and addresses files
+	eventsPath := filepath.Join(dirPath, "events.json")
+	addressesPath := filepath.Join(dirPath, "address_book.json")
+
+	events, err := os.ReadFile(eventsPath)
+	if err != nil {
+		return nil, fmt.Errorf("read events: %w", err)
+	}
+
+	addresses, err := os.ReadFile(addressesPath)
+	if err != nil {
+		return nil, fmt.Errorf("read addresses: %w", err)
+	}
+
+	var response models.Response
+
+	if err := json.Unmarshal(events, &response.Events); err != nil {
+		return nil, fmt.Errorf("unmarshal events: %w", err)
+	}
+
+	if err := json.Unmarshal(addresses, &response.AddressBook); err != nil {
+		return nil, fmt.Errorf("unmarshal addresses: %w", err)
+	}
+
+	return &response, nil
+}
+
+func (fs *FileSystem) GetBlockRange(start, end int) ([]models.Response, error) {
+	if end < start {
+		return nil, fmt.Errorf("invalid range: end < start")
+	}
+
+	var responses []models.Response
+	for blockNum := start; blockNum <= end; blockNum++ {
+		response, err := fs.GetBlockData(blockNum)
+		if err != nil {
+			continue // Skip blocks that don't exist
+		}
+		responses = append(responses, *response)
+	}
+
+	if len(responses) == 0 {
+		return nil, fmt.Errorf("no blocks found in range %d-%d", start, end)
+	}
+
+	return responses, nil
+}
