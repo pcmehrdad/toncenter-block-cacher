@@ -59,53 +59,6 @@ func (fs *FileSystem) SaveBlock(blockNum int, data []byte) error {
 	return os.WriteFile(filename, data, 0644)
 }
 
-func (fs *FileSystem) GetLastBlock() (int, error) {
-	files, err := os.ReadDir(fs.basePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
-		return 0, err
-	}
-
-	var maxBlock int
-	for _, file := range files {
-		if file.IsDir() || !strings.HasSuffix(file.Name(), ".json") {
-			continue
-		}
-		blockNum, err := strconv.Atoi(strings.TrimSuffix(file.Name(), ".json"))
-		if err != nil {
-			continue
-		}
-		if blockNum > maxBlock {
-			maxBlock = blockNum
-		}
-	}
-	return maxBlock, nil
-}
-
-func (fs *FileSystem) IsBlockValid(blockNum int) bool {
-	filename := filepath.Join(fs.basePath, fmt.Sprintf("%d.json", blockNum))
-
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return false
-	}
-
-	// Check if it's a valid JSON and has the expected structure
-	var response struct {
-		Events      []json.RawMessage      `json:"events"`
-		AddressBook map[string]interface{} `json:"address_book"`
-	}
-
-	if err := json.Unmarshal(data, &response); err != nil {
-		return false
-	}
-
-	// Check if basic structure is present
-	return response.Events != nil && response.AddressBook != nil
-}
-
 func (fs *FileSystem) ReadBlock(blockNum int) (json.RawMessage, error) {
 	filename := filepath.Join(fs.basePath, fmt.Sprintf("%d.json", blockNum))
 	data, err := os.ReadFile(filename)
