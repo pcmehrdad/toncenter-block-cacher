@@ -30,19 +30,21 @@ const (
 
 // BlockVerifier handles block verification and repair operations
 type BlockVerifier struct {
-	fs              *utils.FileSystem
-	apiClient       *api.Client
-	processedBlocks map[int]bool
-	mutex           sync.RWMutex
-	fetchLimit      int
+	fs                *utils.FileSystem
+	apiClient         *api.Client
+	processedBlocks   map[int]bool
+	lastVerifiedBlock map[int]time.Time // Track when each block was last verified
+	mutex             sync.RWMutex
+	fetchLimit        int
 }
 
 func NewBlockVerifier(fs *utils.FileSystem, apiClient *api.Client, fetchLimit int) *BlockVerifier {
 	return &BlockVerifier{
-		fs:              fs,
-		apiClient:       apiClient,
-		processedBlocks: make(map[int]bool),
-		fetchLimit:      fetchLimit,
+		fs:                fs,
+		apiClient:         apiClient,
+		processedBlocks:   make(map[int]bool),
+		lastVerifiedBlock: make(map[int]time.Time),
+		fetchLimit:        fetchLimit,
 	}
 }
 
@@ -52,18 +54,44 @@ func (bv *BlockVerifier) MarkProcessed(blockNum int) {
 	bv.mutex.Unlock()
 }
 
-func (bv *BlockVerifier) CleanOldBlocks(maxAge int) {
-	bv.mutex.Lock()
-	defer bv.mutex.Unlock()
+func (bv *BlockVerifier) VerifyRange(ctx context.Context, startBlock, endBlock int) error {
+	now := time.Now()
 
-	for blockNum := range bv.processedBlocks {
-		if blockNum < maxAge {
-			delete(bv.processedBlocks, blockNum)
+	// Define verification schedules based on block age
+	var blocksToVerify []int
+
+	// Check recent blocks (last hour) every minute
+	recentCutoff := endBlock - 3600 // Last hour
+	for blockNum := getMax(recentCutoff, startBlock); blockNum <= endBlock; blockNum++ {
+		lastVerified, exists := bv.lastVerifiedBlock[blockNum]
+		if !exists || now.Sub(lastVerified) > time.Minute {
+			blocksToVerify = append(blocksToVerify, blockNum)
 		}
 	}
-}
 
-func (bv *BlockVerifier) VerifyRange(ctx context.Context, startBlock, endBlock int) error {
+	// Check older blocks (1-12 hours old) every 10 minutes
+	mediumCutoff := endBlock - 43200 // Last 12 hours
+	for blockNum := getMax(mediumCutoff, startBlock); blockNum < recentCutoff; blockNum++ {
+		lastVerified, exists := bv.lastVerifiedBlock[blockNum]
+		if !exists || now.Sub(lastVerified) > 10*time.Minute {
+			blocksToVerify = append(blocksToVerify, blockNum)
+		}
+	}
+
+	// Check oldest blocks (>12 hours) every hour
+	for blockNum := startBlock; blockNum < mediumCutoff; blockNum++ {
+		lastVerified, exists := bv.lastVerifiedBlock[blockNum]
+		if !exists || now.Sub(lastVerified) > time.Hour {
+			blocksToVerify = append(blocksToVerify, blockNum)
+		}
+	}
+
+	// If no blocks need verification, return early
+	if len(blocksToVerify) == 0 {
+		return nil
+	}
+
+	// Process blocks that need verification
 	var (
 		wg         sync.WaitGroup
 		repairChan = make(chan int, MAX_CONCURRENT_REPAIRS)
@@ -85,8 +113,11 @@ func (bv *BlockVerifier) VerifyRange(ctx context.Context, startBlock, endBlock i
 						default:
 						}
 					} else {
-						bv.MarkProcessed(blockNum)
-						log.Printf("Repaired block %d", blockNum)
+						bv.mutex.Lock()
+						bv.processedBlocks[blockNum] = true
+						bv.lastVerifiedBlock[blockNum] = now
+						bv.mutex.Unlock()
+						log.Printf("Verified/Repaired block %d", blockNum)
 					}
 					<-sem
 				case <-ctx.Done():
@@ -96,27 +127,20 @@ func (bv *BlockVerifier) VerifyRange(ctx context.Context, startBlock, endBlock i
 		}()
 	}
 
-	// Check blocks in batches
-	for start := startBlock; start <= endBlock; start += BATCH_SIZE {
-		end := start + BATCH_SIZE
-		if end > endBlock {
-			end = endBlock
-		}
+	// Send blocks to verification
+	for _, blockNum := range blocksToVerify {
+		select {
+		case <-ctx.Done():
+			close(repairChan)
+			wg.Wait()
+			return ctx.Err()
+		default:
+			bv.mutex.RLock()
+			processed := bv.processedBlocks[blockNum]
+			bv.mutex.RUnlock()
 
-		for blockNum := start; blockNum < end; blockNum++ {
-			select {
-			case <-ctx.Done():
-				close(repairChan)
-				wg.Wait()
-				return ctx.Err()
-			default:
-				bv.mutex.RLock()
-				processed := bv.processedBlocks[blockNum]
-				bv.mutex.RUnlock()
-
-				if !processed || !bv.fs.IsBlockValid(blockNum) {
-					repairChan <- blockNum
-				}
+			if !processed || !bv.fs.IsBlockValid(blockNum) {
+				repairChan <- blockNum
 			}
 		}
 	}
@@ -130,6 +154,26 @@ func (bv *BlockVerifier) VerifyRange(ctx context.Context, startBlock, endBlock i
 	default:
 		return nil
 	}
+}
+
+func (bv *BlockVerifier) CleanOldBlocks(maxAge int) {
+	bv.mutex.Lock()
+	defer bv.mutex.Unlock()
+
+	for blockNum := range bv.processedBlocks {
+		if blockNum < maxAge {
+			delete(bv.processedBlocks, blockNum)
+			delete(bv.lastVerifiedBlock, blockNum)
+		}
+	}
+}
+
+// Helper function
+func getMax(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func main() {
