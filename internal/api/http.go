@@ -80,10 +80,8 @@ func (s *Server) Start(addr string) error {
 		}
 
 		response := map[string]interface{}{
-			"blocks": blocks,
-			"count":  len(blocks),
-			"first":  blocks[0],
-			"last":   blocks[len(blocks)-1],
+			"from": blocks[0],
+			"to":   blocks[len(blocks)-1],
 		}
 
 		w.Header().Set("Content-Type", "application/json")

@@ -1,4 +1,3 @@
-// File: cmd/processor/main.go
 package main
 
 import (
@@ -8,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,8 +24,74 @@ const (
 	MAX_RETRIES = 3
 )
 
+type BlockProcessor struct {
+	client    *ton.APIClient
+	apiClient *api.Client
+	fs        *utils.FileSystem
+	cfg       *config.Config
+	lastBlock int
+	mu        sync.RWMutex
+
+	// Track blocks being processed
+	processingBlocks sync.Map
+}
+
+func NewBlockProcessor(client *ton.APIClient, apiClient *api.Client, fs *utils.FileSystem, cfg *config.Config) *BlockProcessor {
+	return &BlockProcessor{
+		client:    client,
+		apiClient: apiClient,
+		fs:        fs,
+		cfg:       cfg,
+	}
+}
+
+func (bp *BlockProcessor) setLastBlock(block int) {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	bp.lastBlock = block
+}
+
+func (bp *BlockProcessor) getLastBlock() int {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+	return bp.lastBlock
+}
+
+func (bp *BlockProcessor) tryProcessBlock(blockNum int) bool {
+	_, loaded := bp.processingBlocks.LoadOrStore(blockNum, true)
+	return !loaded
+}
+
+func (bp *BlockProcessor) finishProcessing(blockNum int) {
+	bp.processingBlocks.Delete(blockNum)
+}
+
+func (bp *BlockProcessor) processBlockWithRetry(blockNum int) error {
+	// Check if block is already being processed or exists
+	if !bp.tryProcessBlock(blockNum) {
+		return nil // Block is being processed by another routine
+	}
+	defer bp.finishProcessing(blockNum)
+
+	// Check if block already exists
+	if bp.fs.BlockExists(blockNum) {
+		return nil
+	}
+
+	var lastErr error
+	for retry := 0; retry < MAX_RETRIES; retry++ {
+		if err := processBlock(bp.apiClient, bp.fs, blockNum, bp.cfg.FetchLimit); err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(retry+1) * time.Second)
+			continue
+		}
+		log.Printf("Successfully processed block %d", blockNum)
+		return nil
+	}
+	return lastErr
+}
+
 func main() {
-	// Channel for graceful shutdown and config reload
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 
@@ -34,7 +100,6 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Initialize components
 	client := initTONClient()
 	fs := utils.NewFileSystem(cfg.BlocksSavePath)
 	apiClient := api.NewClient(
@@ -47,25 +112,20 @@ func main() {
 		log.Fatalf("Failed to create data directory: %v", err)
 	}
 
-	master, err := client.GetMasterchainInfo(context.Background())
-	if err != nil {
-		log.Fatalf("Failed to get masterchain info: %v", err)
-	}
+	processor := NewBlockProcessor(client, apiClient, fs, cfg)
 
-	currentBlock := int(master.SeqNo) - BLOCK_LAG
-	startBlock := currentBlock - cfg.MaxSavedBlocks
-	if startBlock < 0 {
-		startBlock = 0
-	}
+	// Create channels for coordination
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Initial cleanup and sync
-	if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
-		log.Printf("Initial cleanup error: %v", err)
-	}
+	// Start the chain monitoring goroutine
+	go processor.monitorChainUpdates(ctx)
 
-	if err := syncRange(apiClient, fs, startBlock, currentBlock, cfg); err != nil {
-		log.Printf("Initial sync error: %v", err)
-	}
+	// Start the historical sync goroutine
+	go processor.syncHistoricalBlocks(ctx)
+
+	// Start the cleanup goroutine
+	go processor.periodicCleanup(ctx)
 
 	// Initialize and start HTTP server
 	httpServer := api.NewServer(fs)
@@ -76,58 +136,142 @@ func main() {
 		}
 	}()
 
-	var lastProcessedBlock int = currentBlock
-
-	// Config reload goroutine
-	go func() {
-		for sig := range sigChan {
-			switch sig {
-			case syscall.SIGHUP:
-				if newCfg, err := config.LoadConfig(); err != nil {
-					log.Printf("Error reloading config: %v", err)
-				} else {
-					cfg = newCfg
-					if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
-						log.Printf("Error enforcing new block limit: %v", err)
-					}
-					log.Printf("Configuration reloaded, enforced max blocks: %d", cfg.MaxSavedBlocks)
-				}
-			case syscall.SIGINT, syscall.SIGTERM:
-				log.Println("Shutting down gracefully...")
-				os.Exit(0)
+	// Handle configuration reload and shutdown
+	for sig := range sigChan {
+		switch sig {
+		case syscall.SIGHUP:
+			if newCfg, err := config.LoadConfig(); err != nil {
+				log.Printf("Error reloading config: %v", err)
+			} else {
+				processor.cfg = newCfg
+				log.Printf("Configuration reloaded")
 			}
+		case syscall.SIGINT, syscall.SIGTERM:
+			log.Println("Shutting down gracefully...")
+			cancel()
+			time.Sleep(time.Second) // Give goroutines time to cleanup
+			os.Exit(0)
 		}
-	}()
+	}
+}
 
-	// Main processing loop
+func (bp *BlockProcessor) findMissingBlocks(start, end int) []int {
+	var missing []int
+	for blockNum := start; blockNum <= end; blockNum++ {
+		if !bp.fs.BlockExists(blockNum) {
+			missing = append(missing, blockNum)
+		}
+	}
+	return missing
+}
+
+func (bp *BlockProcessor) monitorChainUpdates(ctx context.Context) {
+	log.Println("Starting chain monitor")
+	ticker := time.NewTicker(bp.cfg.BlockDelay)
+	defer ticker.Stop()
+
 	for {
-		master, err := client.GetMasterchainInfo(context.Background())
-		if err != nil {
-			log.Printf("Error getting masterchain info: %v", err)
-			time.Sleep(cfg.RetryDelay)
-			continue
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			master, err := bp.client.GetMasterchainInfo(ctx)
+			if err != nil {
+				log.Printf("Error getting masterchain info: %v", err)
+				continue
+			}
+
+			currentBlock := int(master.SeqNo) - BLOCK_LAG
+			bp.setLastBlock(currentBlock)
+
+			// Process the latest block only if not already being processed
+			if err := bp.processBlockWithRetry(currentBlock); err != nil {
+				log.Printf("Failed to process latest block %d: %v", currentBlock, err)
+			}
 		}
+	}
+}
 
-		targetBlock := int(master.SeqNo) - BLOCK_LAG
-		httpServer.UpdateLastBlock(targetBlock)
+func (bp *BlockProcessor) syncHistoricalBlocks(ctx context.Context) {
+	log.Println("Starting historical sync")
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
 
-		// Process new blocks
-		if targetBlock > lastProcessedBlock {
-			for blockNum := lastProcessedBlock + 1; blockNum <= targetBlock; blockNum++ {
-				if err := processBlockWithRetry(apiClient, fs, blockNum, cfg.FetchLimit); err != nil {
-					log.Printf("Failed to process block %d: %v", blockNum, err)
-					continue
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			currentBlock := bp.getLastBlock()
+			if currentBlock == 0 {
+				continue // Wait for the chain monitor to get the first block
+			}
+
+			startBlock := currentBlock - bp.cfg.MaxSavedBlocks
+			if startBlock < 0 {
+				startBlock = 0
+			}
+
+			// Find all missing blocks in our range
+			missingBlocks := bp.findMissingBlocks(startBlock, currentBlock)
+			if len(missingBlocks) > 0 {
+				log.Printf("Found %d missing blocks in range %d-%d", len(missingBlocks), startBlock, currentBlock)
+			}
+
+			// Process missing blocks in batches
+			const batchSize = 10
+			for i := 0; i < len(missingBlocks); i += batchSize {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					end := i + batchSize
+					if end > len(missingBlocks) {
+						end = len(missingBlocks)
+					}
+
+					batch := missingBlocks[i:end]
+					var wg sync.WaitGroup
+					semaphore := make(chan struct{}, 3) // Limit concurrent processing
+
+					for _, blockNum := range batch {
+						wg.Add(1)
+						semaphore <- struct{}{} // Acquire semaphore
+
+						go func(num int) {
+							defer wg.Done()
+							defer func() { <-semaphore }() // Release semaphore
+
+							if err := bp.processBlockWithRetry(num); err != nil {
+								log.Printf("Failed to process historical block %d: %v", num, err)
+							}
+						}(blockNum)
+					}
+
+					wg.Wait()
+					time.Sleep(bp.cfg.BlockDelay) // Rate limiting between batches
 				}
-				lastProcessedBlock = blockNum
-				log.Printf("Processed block %d", blockNum)
-			}
-
-			if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
-				log.Printf("Error cleaning old blocks: %v", err)
 			}
 		}
+	}
+}
 
-		time.Sleep(cfg.BlockDelay)
+func (bp *BlockProcessor) periodicCleanup(ctx context.Context) {
+	log.Println("Starting periodic cleanup")
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := bp.fs.RemoveOldBlocks(bp.cfg.MaxSavedBlocks); err != nil {
+				log.Printf("Error cleaning old blocks: %v", err)
+			} else {
+				log.Println("Completed periodic cleanup")
+			}
+		}
 	}
 }
 
@@ -187,31 +331,4 @@ func processBlock(client *api.Client, fs *utils.FileSystem, blockNum, limit int)
 	}
 
 	return fs.SaveBlock(blockNum, combinedData)
-}
-
-func processBlockWithRetry(client *api.Client, fs *utils.FileSystem, blockNum, limit int) error {
-	var lastErr error
-	for retry := 0; retry < MAX_RETRIES; retry++ {
-		if err := processBlock(client, fs, blockNum, limit); err != nil {
-			lastErr = err
-			time.Sleep(time.Duration(retry+1) * time.Second)
-			continue
-		}
-		return nil
-	}
-	return lastErr
-}
-
-func syncRange(apiClient *api.Client, fs *utils.FileSystem, start, end int, cfg *config.Config) error {
-	log.Printf("Syncing blocks from %d to %d", start, end)
-
-	for blockNum := start; blockNum <= end; blockNum++ {
-		if err := processBlockWithRetry(apiClient, fs, blockNum, cfg.FetchLimit); err != nil {
-			return fmt.Errorf("failed to process block %d: %w", blockNum, err)
-		}
-		log.Printf("Processed block %d", blockNum)
-		time.Sleep(cfg.BlockDelay)
-	}
-
-	return nil
 }

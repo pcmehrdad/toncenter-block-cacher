@@ -3,6 +3,7 @@ package utils
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -74,20 +75,74 @@ func (fs *FileSystem) GetAvailableBlocks() ([]int, error) {
 		return nil, fmt.Errorf("read directory: %w", err)
 	}
 
-	var blocks []int
+	// Pre-allocate slice with 2 capacity since we only need min and max
+	blocks := make([]int, 0, 2)
+	minBlock, maxBlock := math.MaxInt, math.MinInt
+
 	for _, file := range files {
-		if !file.IsDir() && strings.HasSuffix(file.Name(), ".json") {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".json") {
+			continue
+		}
+
+		blockNum, err := strconv.Atoi(strings.TrimSuffix(file.Name(), ".json"))
+		if err != nil {
+			continue
+		}
+
+		if blockNum < minBlock {
+			minBlock = blockNum
+		}
+		if blockNum > maxBlock {
+			maxBlock = blockNum
+		}
+	}
+
+	if maxBlock == math.MinInt {
+		return nil, fmt.Errorf("no valid blocks found")
+	}
+
+	// Only append min and max to satisfy the interface
+	blocks = append(blocks, minBlock)
+	if maxBlock != minBlock {
+		blocks = append(blocks, maxBlock)
+	}
+
+	return blocks, nil
+}
+func (fs *FileSystem) GetBlockGaps(start, end int) ([]int, error) {
+	var missing []int
+
+	// Create a map of existing blocks
+	existing := make(map[int]bool)
+	files, err := os.ReadDir(fs.basePath)
+	if err != nil {
+		return nil, fmt.Errorf("reading directory: %w", err)
+	}
+
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".json") {
 			blockNum, err := strconv.Atoi(strings.TrimSuffix(file.Name(), ".json"))
-			if err == nil {
-				blocks = append(blocks, blockNum)
+			if err != nil {
+				continue
+			}
+			if blockNum >= start && blockNum <= end {
+				existing[blockNum] = true
 			}
 		}
 	}
 
-	if len(blocks) == 0 {
-		return nil, fmt.Errorf("no valid blocks found")
+	// Find missing blocks
+	for blockNum := start; blockNum <= end; blockNum++ {
+		if !existing[blockNum] {
+			missing = append(missing, blockNum)
+		}
 	}
 
-	sort.Ints(blocks)
-	return blocks, nil
+	return missing, nil
+}
+
+func (fs *FileSystem) BlockExists(blockNum int) bool {
+	filename := fmt.Sprintf("%d.json", blockNum)
+	_, err := os.Stat(filepath.Join(fs.basePath, filename))
+	return err == nil
 }
