@@ -21,10 +21,116 @@ import (
 )
 
 const (
-	BLOCK_LAG       = 5
-	VERIFY_INTERVAL = 1 * time.Minute
-	MAX_RETRIES     = 3
+	BLOCK_LAG              = 5
+	VERIFY_INTERVAL        = 15 * time.Second // Reduced from 1 minute
+	MAX_RETRIES            = 3
+	MAX_CONCURRENT_REPAIRS = 10
+	BATCH_SIZE             = 100
 )
+
+// BlockVerifier handles block verification and repair operations
+type BlockVerifier struct {
+	fs              *utils.FileSystem
+	apiClient       *api.Client
+	processedBlocks map[int]bool
+	mutex           sync.RWMutex
+	fetchLimit      int
+}
+
+func NewBlockVerifier(fs *utils.FileSystem, apiClient *api.Client, fetchLimit int) *BlockVerifier {
+	return &BlockVerifier{
+		fs:              fs,
+		apiClient:       apiClient,
+		processedBlocks: make(map[int]bool),
+		fetchLimit:      fetchLimit,
+	}
+}
+
+func (bv *BlockVerifier) MarkProcessed(blockNum int) {
+	bv.mutex.Lock()
+	bv.processedBlocks[blockNum] = true
+	bv.mutex.Unlock()
+}
+
+func (bv *BlockVerifier) CleanOldBlocks(maxAge int) {
+	bv.mutex.Lock()
+	defer bv.mutex.Unlock()
+
+	for blockNum := range bv.processedBlocks {
+		if blockNum < maxAge {
+			delete(bv.processedBlocks, blockNum)
+		}
+	}
+}
+
+func (bv *BlockVerifier) VerifyRange(ctx context.Context, startBlock, endBlock int) error {
+	var (
+		wg         sync.WaitGroup
+		repairChan = make(chan int, MAX_CONCURRENT_REPAIRS)
+		errorChan  = make(chan error, 1)
+		sem        = make(chan struct{}, MAX_CONCURRENT_REPAIRS)
+	)
+
+	// Start repair workers
+	for i := 0; i < MAX_CONCURRENT_REPAIRS; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for blockNum := range repairChan {
+				select {
+				case sem <- struct{}{}:
+					if err := processBlockWithRetry(bv.apiClient, bv.fs, blockNum, bv.fetchLimit); err != nil {
+						select {
+						case errorChan <- fmt.Errorf("failed to repair block %d: %w", blockNum, err):
+						default:
+						}
+					} else {
+						bv.MarkProcessed(blockNum)
+						log.Printf("Repaired block %d", blockNum)
+					}
+					<-sem
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	// Check blocks in batches
+	for start := startBlock; start <= endBlock; start += BATCH_SIZE {
+		end := start + BATCH_SIZE
+		if end > endBlock {
+			end = endBlock
+		}
+
+		for blockNum := start; blockNum < end; blockNum++ {
+			select {
+			case <-ctx.Done():
+				close(repairChan)
+				wg.Wait()
+				return ctx.Err()
+			default:
+				bv.mutex.RLock()
+				processed := bv.processedBlocks[blockNum]
+				bv.mutex.RUnlock()
+
+				if !processed || !bv.fs.IsBlockValid(blockNum) {
+					repairChan <- blockNum
+				}
+			}
+		}
+	}
+
+	close(repairChan)
+	wg.Wait()
+
+	select {
+	case err := <-errorChan:
+		return err
+	default:
+		return nil
+	}
+}
 
 func main() {
 	// Channel for graceful shutdown and config reload
@@ -36,7 +142,7 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Initialize TON client
+	// Initialize components
 	client := initTONClient()
 	fs := utils.NewFileSystem(cfg.BlocksSavePath)
 	apiClient := api.NewClient(
@@ -44,6 +150,7 @@ func main() {
 		cfg.ToncenterAPIKey,
 		cfg.ToncenterRPS,
 	)
+	verifier := NewBlockVerifier(fs, apiClient, cfg.FetchLimit)
 
 	if err := os.MkdirAll(cfg.BlocksSavePath, 0755); err != nil {
 		log.Fatalf("Failed to create data directory: %v", err)
@@ -60,12 +167,7 @@ func main() {
 		startBlock = 0
 	}
 
-	// Track processed and verified blocks
-	processedBlocks := make(map[int]bool)
-	var processedMutex sync.RWMutex
-	lastVerifyTime := time.Now()
-
-	// Enforce initial cleanup based on config
+	// Initial cleanup and sync
 	if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
 		log.Printf("Initial cleanup error: %v", err)
 	}
@@ -84,26 +186,22 @@ func main() {
 	}()
 
 	var lastProcessedBlock int = currentBlock
+	lastVerifyTime := time.Now()
 
 	// Config reload goroutine
 	go func() {
 		for sig := range sigChan {
 			switch sig {
 			case syscall.SIGHUP:
-				// Reload config
-				newCfg, err := config.LoadConfig()
-				if err != nil {
+				if newCfg, err := config.LoadConfig(); err != nil {
 					log.Printf("Error reloading config: %v", err)
-					continue
+				} else {
+					cfg = newCfg
+					if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
+						log.Printf("Error enforcing new block limit: %v", err)
+					}
+					log.Printf("Configuration reloaded, enforced max blocks: %d", cfg.MaxSavedBlocks)
 				}
-
-				// Update config and enforce new block limit
-				cfg = newCfg
-				if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
-					log.Printf("Error enforcing new block limit: %v", err)
-				}
-				log.Printf("Configuration reloaded, enforced max blocks: %d", cfg.MaxSavedBlocks)
-
 			case syscall.SIGINT, syscall.SIGTERM:
 				log.Println("Shutting down gracefully...")
 				os.Exit(0)
@@ -111,6 +209,7 @@ func main() {
 		}
 	}()
 
+	// Main processing loop
 	for {
 		master, err := client.GetMasterchainInfo(context.Background())
 		if err != nil {
@@ -122,75 +221,43 @@ func main() {
 		targetBlock := int(master.SeqNo) - BLOCK_LAG
 		httpServer.UpdateLastBlock(targetBlock)
 
+		// Process new blocks
 		if targetBlock > lastProcessedBlock {
-			newBlocks := make([]int, 0, targetBlock-lastProcessedBlock)
-			for b := lastProcessedBlock + 1; b <= targetBlock; b++ {
-				newBlocks = append(newBlocks, b)
-			}
-
-			// Process new blocks
-			for _, blockNum := range newBlocks {
+			for blockNum := lastProcessedBlock + 1; blockNum <= targetBlock; blockNum++ {
 				if err := processBlockWithRetry(apiClient, fs, blockNum, cfg.FetchLimit); err != nil {
 					log.Printf("Failed to process block %d: %v", blockNum, err)
 					continue
 				}
-				processedMutex.Lock()
-				processedBlocks[blockNum] = true
-				processedMutex.Unlock()
+				verifier.MarkProcessed(blockNum)
 				lastProcessedBlock = blockNum
 				log.Printf("Processed block %d", blockNum)
 			}
 
-			// Clean up after processing new blocks
 			if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
 				log.Printf("Error cleaning old blocks: %v", err)
 			}
 		}
 
-		// Periodic verification
+		// Periodic verification with improved parallel processing
 		if time.Since(lastVerifyTime) >= VERIFY_INTERVAL {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			verifyRange := targetBlock - cfg.MaxSavedBlocks
 			if verifyRange < 0 {
 				verifyRange = 0
 			}
 
-			repairCount := 0
-			for blockNum := verifyRange; blockNum <= targetBlock; blockNum++ {
-				processedMutex.RLock()
-				processed := processedBlocks[blockNum]
-				processedMutex.RUnlock()
-
-				if !processed || !fs.IsBlockValid(blockNum) {
-					if repairCount >= 5 {
-						break
-					}
-					log.Printf("Repairing block %d", blockNum)
-					if err := processBlockWithRetry(apiClient, fs, blockNum, cfg.FetchLimit); err != nil {
-						log.Printf("Failed to repair block %d: %v", blockNum, err)
-					} else {
-						processedMutex.Lock()
-						processedBlocks[blockNum] = true
-						processedMutex.Unlock()
-						repairCount++
-					}
-				}
+			if err := verifier.VerifyRange(ctx, verifyRange, targetBlock); err != nil {
+				log.Printf("Verification error: %v", err)
 			}
+			cancel()
 			lastVerifyTime = time.Now()
 
-			// Clean up after verification
+			// Cleanup operations
 			if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
 				log.Printf("Error cleaning old blocks: %v", err)
 			}
+			verifier.CleanOldBlocks(targetBlock - cfg.MaxSavedBlocks)
 		}
-
-		// Clean up processed blocks map
-		processedMutex.Lock()
-		for blockNum := range processedBlocks {
-			if blockNum < targetBlock-cfg.MaxSavedBlocks {
-				delete(processedBlocks, blockNum)
-			}
-		}
-		processedMutex.Unlock()
 
 		time.Sleep(cfg.BlockDelay)
 	}
@@ -217,7 +284,6 @@ func processBlock(client *api.Client, fs *utils.FileSystem, blockNum, limit int)
 			return fmt.Errorf("fetch chunk: %w", err)
 		}
 
-		// Parse response for merging
 		var response struct {
 			Events      []json.RawMessage      `json:"events"`
 			AddressBook map[string]interface{} `json:"address_book"`
@@ -227,7 +293,6 @@ func processBlock(client *api.Client, fs *utils.FileSystem, blockNum, limit int)
 			return fmt.Errorf("parse response: %w", err)
 		}
 
-		// Merge events and address book
 		finalEvents = append(finalEvents, response.Events...)
 		if finalAddressBook == nil {
 			finalAddressBook = response.AddressBook
@@ -243,13 +308,11 @@ func processBlock(client *api.Client, fs *utils.FileSystem, blockNum, limit int)
 		offset += limit
 	}
 
-	// Create combined response
 	finalResponse := map[string]interface{}{
 		"events":       finalEvents,
 		"address_book": finalAddressBook,
 	}
 
-	// Marshal with indentation
 	combinedData, err := json.MarshalIndent(finalResponse, "", "    ")
 	if err != nil {
 		return fmt.Errorf("marshal final response: %w", err)
