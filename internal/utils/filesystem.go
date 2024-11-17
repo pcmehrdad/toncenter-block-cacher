@@ -121,20 +121,13 @@ func (fs *FileSystem) GetAvailableBlocks() ([]int, error) {
 		return nil, fmt.Errorf("read directory: %w", err)
 	}
 
-	blocks := make([]int, 0, len(files))
+	var blocks []int
 	for _, file := range files {
-		if file.IsDir() || !strings.HasSuffix(file.Name(), ".json") {
-			continue
-		}
-
-		blockNum, err := strconv.Atoi(strings.TrimSuffix(file.Name(), ".json"))
-		if err != nil {
-			continue
-		}
-
-		// Verify block is valid
-		if fs.IsBlockValid(blockNum) {
-			blocks = append(blocks, blockNum)
+		if !file.IsDir() && strings.HasSuffix(file.Name(), ".json") {
+			blockNum, err := strconv.Atoi(strings.TrimSuffix(file.Name(), ".json"))
+			if err == nil {
+				blocks = append(blocks, blockNum)
+			}
 		}
 	}
 

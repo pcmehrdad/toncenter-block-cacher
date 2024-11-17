@@ -46,7 +46,7 @@ func LoadConfig() (*Config, error) {
 
 		// Storage Configuration
 		BlocksSavePath: "./data/blocks",
-		MaxSavedBlocks: intEnv("MAX_SAVED_BLOCKS", 50),
+		MaxSavedBlocks: intEnv("MAX_SAVED_BLOCKS", 50) + 20,
 
 		// Block Processing Configuration
 		MaxParallelFetches: intEnv("MAX_PARALLEL_FETCHES", 5),

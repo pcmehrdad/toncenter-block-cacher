@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -21,160 +20,9 @@ import (
 )
 
 const (
-	BLOCK_LAG              = 5
-	VERIFY_INTERVAL        = 15 * time.Second // Reduced from 1 minute
-	MAX_RETRIES            = 3
-	MAX_CONCURRENT_REPAIRS = 10
-	BATCH_SIZE             = 100
+	BLOCK_LAG   = 5
+	MAX_RETRIES = 3
 )
-
-// BlockVerifier handles block verification and repair operations
-type BlockVerifier struct {
-	fs                *utils.FileSystem
-	apiClient         *api.Client
-	processedBlocks   map[int]bool
-	lastVerifiedBlock map[int]time.Time // Track when each block was last verified
-	mutex             sync.RWMutex
-	fetchLimit        int
-}
-
-func NewBlockVerifier(fs *utils.FileSystem, apiClient *api.Client, fetchLimit int) *BlockVerifier {
-	return &BlockVerifier{
-		fs:                fs,
-		apiClient:         apiClient,
-		processedBlocks:   make(map[int]bool),
-		lastVerifiedBlock: make(map[int]time.Time),
-		fetchLimit:        fetchLimit,
-	}
-}
-
-func (bv *BlockVerifier) MarkProcessed(blockNum int) {
-	bv.mutex.Lock()
-	bv.processedBlocks[blockNum] = true
-	bv.mutex.Unlock()
-}
-
-func (bv *BlockVerifier) VerifyRange(ctx context.Context, startBlock, endBlock int) error {
-	now := time.Now()
-
-	// Define verification schedules based on block age
-	var blocksToVerify []int
-
-	// Check recent blocks (last hour) every minute
-	recentCutoff := endBlock - 3600 // Last hour
-	for blockNum := getMax(recentCutoff, startBlock); blockNum <= endBlock; blockNum++ {
-		lastVerified, exists := bv.lastVerifiedBlock[blockNum]
-		if !exists || now.Sub(lastVerified) > time.Minute {
-			blocksToVerify = append(blocksToVerify, blockNum)
-		}
-	}
-
-	// Check older blocks (1-12 hours old) every 10 minutes
-	mediumCutoff := endBlock - 43200 // Last 12 hours
-	for blockNum := getMax(mediumCutoff, startBlock); blockNum < recentCutoff; blockNum++ {
-		lastVerified, exists := bv.lastVerifiedBlock[blockNum]
-		if !exists || now.Sub(lastVerified) > 10*time.Minute {
-			blocksToVerify = append(blocksToVerify, blockNum)
-		}
-	}
-
-	// Check oldest blocks (>12 hours) every hour
-	for blockNum := startBlock; blockNum < mediumCutoff; blockNum++ {
-		lastVerified, exists := bv.lastVerifiedBlock[blockNum]
-		if !exists || now.Sub(lastVerified) > time.Hour {
-			blocksToVerify = append(blocksToVerify, blockNum)
-		}
-	}
-
-	// If no blocks need verification, return early
-	if len(blocksToVerify) == 0 {
-		return nil
-	}
-
-	// Process blocks that need verification
-	var (
-		wg         sync.WaitGroup
-		repairChan = make(chan int, MAX_CONCURRENT_REPAIRS)
-		errorChan  = make(chan error, 1)
-		sem        = make(chan struct{}, MAX_CONCURRENT_REPAIRS)
-	)
-
-	// Start repair workers
-	for i := 0; i < MAX_CONCURRENT_REPAIRS; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for blockNum := range repairChan {
-				select {
-				case sem <- struct{}{}:
-					if err := processBlockWithRetry(bv.apiClient, bv.fs, blockNum, bv.fetchLimit); err != nil {
-						select {
-						case errorChan <- fmt.Errorf("failed to repair block %d: %w", blockNum, err):
-						default:
-						}
-					} else {
-						bv.mutex.Lock()
-						bv.processedBlocks[blockNum] = true
-						bv.lastVerifiedBlock[blockNum] = now
-						bv.mutex.Unlock()
-						log.Printf("Verified/Repaired block %d", blockNum)
-					}
-					<-sem
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-	}
-
-	// Send blocks to verification
-	for _, blockNum := range blocksToVerify {
-		select {
-		case <-ctx.Done():
-			close(repairChan)
-			wg.Wait()
-			return ctx.Err()
-		default:
-			bv.mutex.RLock()
-			processed := bv.processedBlocks[blockNum]
-			bv.mutex.RUnlock()
-
-			if !processed || !bv.fs.IsBlockValid(blockNum) {
-				repairChan <- blockNum
-			}
-		}
-	}
-
-	close(repairChan)
-	wg.Wait()
-
-	select {
-	case err := <-errorChan:
-		return err
-	default:
-		return nil
-	}
-}
-
-func (bv *BlockVerifier) CleanOldBlocks(maxAge int) {
-	bv.mutex.Lock()
-	defer bv.mutex.Unlock()
-
-	for blockNum := range bv.processedBlocks {
-		if blockNum < maxAge {
-			delete(bv.processedBlocks, blockNum)
-			delete(bv.lastVerifiedBlock, blockNum)
-		}
-	}
-}
-
-// Helper function
-func getMax(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
 
 func main() {
 	// Channel for graceful shutdown and config reload
@@ -194,7 +42,6 @@ func main() {
 		cfg.ToncenterAPIKey,
 		cfg.ToncenterRPS,
 	)
-	verifier := NewBlockVerifier(fs, apiClient, cfg.FetchLimit)
 
 	if err := os.MkdirAll(cfg.BlocksSavePath, 0755); err != nil {
 		log.Fatalf("Failed to create data directory: %v", err)
@@ -230,7 +77,6 @@ func main() {
 	}()
 
 	var lastProcessedBlock int = currentBlock
-	lastVerifyTime := time.Now()
 
 	// Config reload goroutine
 	go func() {
@@ -272,7 +118,6 @@ func main() {
 					log.Printf("Failed to process block %d: %v", blockNum, err)
 					continue
 				}
-				verifier.MarkProcessed(blockNum)
 				lastProcessedBlock = blockNum
 				log.Printf("Processed block %d", blockNum)
 			}
@@ -280,27 +125,6 @@ func main() {
 			if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
 				log.Printf("Error cleaning old blocks: %v", err)
 			}
-		}
-
-		// Periodic verification with improved parallel processing
-		if time.Since(lastVerifyTime) >= VERIFY_INTERVAL {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			verifyRange := targetBlock - cfg.MaxSavedBlocks
-			if verifyRange < 0 {
-				verifyRange = 0
-			}
-
-			if err := verifier.VerifyRange(ctx, verifyRange, targetBlock); err != nil {
-				log.Printf("Verification error: %v", err)
-			}
-			cancel()
-			lastVerifyTime = time.Now()
-
-			// Cleanup operations
-			if err := fs.RemoveOldBlocks(cfg.MaxSavedBlocks); err != nil {
-				log.Printf("Error cleaning old blocks: %v", err)
-			}
-			verifier.CleanOldBlocks(targetBlock - cfg.MaxSavedBlocks)
 		}
 
 		time.Sleep(cfg.BlockDelay)
