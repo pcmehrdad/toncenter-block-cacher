@@ -157,7 +157,7 @@ func main() {
 
 func (bp *BlockProcessor) findMissingBlocks(start, end int) []int {
 	var missing []int
-	for blockNum := start; blockNum <= end; blockNum++ {
+	for blockNum := end; blockNum >= start; blockNum-- { // Reverse the iteration: start from end and go to start
 		if !bp.fs.BlockExists(blockNum) {
 			missing = append(missing, blockNum)
 		}
