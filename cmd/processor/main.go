@@ -248,7 +248,7 @@ func (bp *BlockProcessor) syncHistoricalBlocks(ctx context.Context) {
 			}
 
 			// Find all missing blocks in our range
-			missingBlocks := bp.findMissingBlocks(startBlock, currentBlock)
+			missingBlocks := bp.findMissingBlocks(startBlock, currentBlock-1)
 			if len(missingBlocks) > 0 {
 				log.Printf("Found %d missing blocks in range %d-%d", len(missingBlocks), startBlock, currentBlock)
 			}
