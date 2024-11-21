@@ -19,6 +19,10 @@ func NewFileSystem(basePath string) *FileSystem {
 	return &FileSystem{basePath: basePath}
 }
 
+func (fs *FileSystem) GetBasePath() string {
+	return fs.basePath
+}
+
 func (fs *FileSystem) RemoveOldBlocks(keepLatest int) error {
 	files, err := os.ReadDir(fs.basePath)
 	if err != nil {

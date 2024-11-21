@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -156,12 +158,45 @@ func main() {
 }
 
 func (bp *BlockProcessor) findMissingBlocks(start, end int) []int {
+	// Get list of files using filesystem method
+	files, err := os.ReadDir(bp.cfg.BlocksSavePath)
+	if err != nil {
+		log.Printf("Error reading directory: %v", err)
+		return nil
+	}
+
+	// Create a map for O(1) lookup of existing blocks
+	existingBlocks := make(map[int]bool)
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".json") {
+			continue
+		}
+		blockNum, err := strconv.Atoi(strings.TrimSuffix(file.Name(), ".json"))
+		if err != nil {
+			continue
+		}
+		// Only add blocks within our range
+		if blockNum >= start && blockNum <= end {
+			existingBlocks[blockNum] = true
+		}
+	}
+
+	// Find missing blocks within range
 	var missing []int
-	for blockNum := end; blockNum >= start; blockNum-- { // Reverse the iteration: start from end and go to start
-		if !bp.fs.BlockExists(blockNum) {
+	for blockNum := end; blockNum >= start; blockNum-- {
+		if !existingBlocks[blockNum] {
 			missing = append(missing, blockNum)
 		}
 	}
+
+	// Add logging to debug
+	if len(missing) > 0 {
+		log.Printf("Range %d-%d: Found %d blocks, Missing %d blocks",
+			start, end,
+			end-start+1-len(missing),
+			len(missing))
+	}
+
 	return missing
 }
 
